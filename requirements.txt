@@ -3,4 +3,5 @@ python-dotenv
 dateparser
 tzdata
 python-dateutil
-spacy 
+spacy
+en-core-web-sm 
