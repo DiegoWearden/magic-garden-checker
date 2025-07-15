@@ -1,0 +1,6 @@
+discord.py
+python-dotenv
+dateparser
+tzdata
+python-dateutil
+spacy 
