@@ -1051,24 +1051,89 @@ async def handle_multiple_meetings(ctx, time_text: str, author_id: str, active_t
     # Clean up the input text
     clean_text = time_text.lower().strip()
     
-    # Remove "make a meeting for" or similar prefixes
-    prefixes_to_remove = ["make a meeting for", "schedule a meeting for", "make meetings for", "schedule meetings for"]
-    for prefix in prefixes_to_remove:
-        if clean_text.startswith(prefix):
-            clean_text = clean_text[len(prefix):].strip()
-            break
+    # Check if this is a single recurring pattern with multiple days (e.g., "every saturday and sunday at 7pm")
+    weekday_map = {"monday": MO, "tuesday": TU, "wednesday": WE, "thursday": TH, "friday": FR, "saturday": SA, "sunday": SU}
+    
+    # Look for patterns like "every [day] and [day] at [time]" or "every [day], [day] at [time]"
+    import re
+    
+    # Check if the text contains multiple days with a single time
+    found_days = []
+    for day_str in weekday_map.keys():
+        if re.search(r'\b' + day_str + r'\b', clean_text):
+            found_days.append(day_str)
+    
+    # If we found multiple days and there's a recurring keyword, create separate meetings for each day
+    if len(found_days) > 1 and ("every" in clean_text or "weekly" in clean_text or "recurring" in clean_text):
+        print(f"[DEBUG] Detected multi-day recurring pattern: {clean_text}")
+        
+        # Remove prefixes from the multi-day pattern
+        prefixes_to_remove = ["make a meeting for", "schedule a meeting for", "make meetings for", "schedule meetings for", "make a meeting", "schedule a meeting"]
+        processed_text = clean_text
+        for prefix in prefixes_to_remove:
+            if processed_text.startswith(prefix):
+                processed_text = processed_text[len(prefix):].strip()
+                break
+        
+        print(f"[DEBUG] After prefix removal: {processed_text}")
+        
+        # Create separate patterns for each day
+        meeting_patterns = []
+        for day in found_days:
+            # Replace the multi-day pattern with single day pattern
+            single_day_pattern = processed_text
+            for other_day in found_days:
+                if other_day != day:
+                    # Remove other days from the pattern
+                    single_day_pattern = single_day_pattern.replace(f" and {other_day}", "")
+                    single_day_pattern = single_day_pattern.replace(f"{other_day} and ", "")
+                    single_day_pattern = single_day_pattern.replace(f", {other_day}", "")
+                    single_day_pattern = single_day_pattern.replace(f"{other_day}, ", "")
+                    single_day_pattern = single_day_pattern.replace(other_day, "")
+            
+            # Clean up any double spaces and trim
+            single_day_pattern = " ".join(single_day_pattern.split())
+            meeting_patterns.append(single_day_pattern)
+        
+        print(f"[DEBUG] Created separate patterns: {meeting_patterns}")
+        
+        # Process each pattern separately
+        scheduled_meetings = []
+        failed_meetings = []
+        
+        for i, pattern in enumerate(meeting_patterns):
+            try:
+                result = await process_single_meeting_pattern(pattern, str(ctx.author.id), active_timezone, ctx)
+                if result:
+                    scheduled_meetings.append(result)
+                else:
+                    failed_meetings.append(f"Pattern {i+1}: '{pattern}'")
+            except Exception as e:
+                failed_meetings.append(f"Pattern {i+1}: '{pattern}' (Error: {str(e)})")
+        
+        # Show comprehensive results
+        await show_multiple_meetings_confirmation(ctx, scheduled_meetings, failed_meetings)
+        return
     
     # Split by "and" and commas, handling both
-    import re
     # Split by comma or " and " while preserving the content
     parts = re.split(r',\s*(?:and\s+)?|(?:\s+and\s+)', clean_text)
     
-    # Clean up each part
+    # Clean up each part and remove prefixes from each individual pattern
     meeting_patterns = []
+    prefixes_to_remove = ["make a meeting for", "schedule a meeting for", "make meetings for", "schedule meetings for", "make a meeting", "schedule a meeting"]
+    
     for part in parts:
         part = part.strip()
         if part:  # Skip empty parts
+            # Remove prefixes from each individual pattern
+            for prefix in prefixes_to_remove:
+                if part.startswith(prefix):
+                    part = part[len(prefix):].strip()
+                    break
             meeting_patterns.append(part)
+
+    print(f"[DEBUG] Meeting patterns to process: {meeting_patterns}")
     
     if not meeting_patterns:
         await ctx.send("I couldn't find any meeting patterns to schedule.")
@@ -1139,8 +1204,27 @@ async def process_single_meeting_pattern(pattern: str, author_id: str, active_ti
 
     # Parse the date/time
     current_time = datetime.datetime.now(ZoneInfo(active_timezone))
+    
+    # For multi-day patterns, try to parse with just one day to get the time
+    parse_text = corrected_text
+    if len(found_weekdays) > 1:
+        # Replace "day1 and day2" with just "day1" for time parsing
+        for day_str in weekday_map.keys():
+            if day_str in corrected_text:
+                # Use the first day found for time parsing
+                parse_text = corrected_text.replace(" and ", " ").replace(", ", " ")
+                # Remove all days except the first one
+                for other_day in weekday_map.keys():
+                    if other_day != day_str and other_day in parse_text:
+                        parse_text = parse_text.replace(other_day, "")
+                parse_text = parse_text.replace("  ", " ").strip()
+                break
+    
+    print(f"[DEBUG] Pattern '{pattern}' -> Attempting to parse: '{parse_text}'")
+    print(f"[DEBUG] Pattern '{pattern}' -> Current time: {current_time}")
+    
     found_dates = search_dates(
-        corrected_text,
+        parse_text,
         settings={
             'TIMEZONE': active_timezone,
             'TO_TIMEZONE': active_timezone,
@@ -1149,22 +1233,80 @@ async def process_single_meeting_pattern(pattern: str, author_id: str, active_ti
         }
     )
     
+    print(f"[DEBUG] Pattern '{pattern}' -> search_dates result: {found_dates}")
+    
     if not found_dates:
+        print(f"[DEBUG] Pattern '{pattern}' -> Failed to parse time")
         return None  # Failed to parse
 
     _, meeting_time_local = found_dates[0]
+    print(f"[DEBUG] Pattern '{pattern}' -> Parsed local time: {meeting_time_local}")
 
     # Convert from user timezone to UTC for storage
     if meeting_time_local.tzinfo is None:
         meeting_time_local = meeting_time_local.replace(tzinfo=ZoneInfo(active_timezone))
     
     meeting_time_utc = meeting_time_local.astimezone(ZoneInfo("UTC"))
+    print(f"[DEBUG] Pattern '{pattern}' -> UTC time: {meeting_time_utc}")
 
-    # Advance to future if needed
+    # For recurring meetings on specific days, we need to handle the time advancement more carefully
     now_utc = datetime.datetime.now(ZoneInfo("UTC"))
+    print(f"[DEBUG] Pattern '{pattern}' -> Current UTC: {now_utc}")
+    
     if meeting_time_utc < now_utc:
-        while meeting_time_utc < now_utc:
-            meeting_time_utc += relativedelta(weeks=1)
+        print(f"[DEBUG] Pattern '{pattern}' -> Time is in the past, advancing...")
+        if recurrence_details and recurrence_details['type'] == 'specific_days':
+            # For recurring meetings, find the next occurrence of the specified day at the same time
+            # Get the time components from the original LOCAL time, not UTC
+            target_hour = meeting_time_local.hour
+            target_minute = meeting_time_local.minute
+            target_second = meeting_time_local.second
+            print(f"[DEBUG] Pattern '{pattern}' -> Target time components: {target_hour}:{target_minute}:{target_second}")
+            
+            # Calculate the next occurrence in the user's timezone first, then convert to UTC
+            now_local = now_utc.astimezone(ZoneInfo(active_timezone))
+            
+            # Find the next occurrence of any of the specified days
+            for day_const in recurrence_details['days']:
+                # Calculate days until next occurrence of this day
+                current_weekday = now_local.weekday()
+                target_weekday = day_const.weekday
+                days_ahead = (target_weekday - current_weekday) % 7
+                if days_ahead == 0:
+                    # If it's the same day, check if the time has passed
+                    today_at_target_time = now_local.replace(hour=target_hour, minute=target_minute, second=target_second, microsecond=0)
+                    if today_at_target_time <= now_local:
+                        days_ahead = 7  # If it's the same day but time has passed, go to next week
+                
+                print(f"[DEBUG] Pattern '{pattern}' -> Current weekday: {current_weekday}, Target weekday: {target_weekday}, Days ahead: {days_ahead}")
+                
+                # Calculate the next occurrence in local time
+                next_occurrence_local = now_local + relativedelta(days=days_ahead, hour=target_hour, minute=target_minute, second=target_second, microsecond=0)
+                print(f"[DEBUG] Pattern '{pattern}' -> Next occurrence (local): {next_occurrence_local}")
+                
+                # Convert to UTC
+                next_occurrence_utc = next_occurrence_local.astimezone(ZoneInfo("UTC"))
+                print(f"[DEBUG] Pattern '{pattern}' -> Next occurrence (UTC): {next_occurrence_utc}")
+                
+                if next_occurrence_utc > now_utc:
+                    meeting_time_utc = next_occurrence_utc
+                    print(f"[DEBUG] Pattern '{pattern}' -> Using next occurrence: {meeting_time_utc}")
+                    break
+            else:
+                # If no valid next occurrence found, advance by a week
+                meeting_time_utc += relativedelta(weeks=1)
+                print(f"[DEBUG] Pattern '{pattern}' -> No valid occurrence found, advancing by week: {meeting_time_utc}")
+        else:
+            # For non-recurring or simple weekly meetings, use the original logic
+            while meeting_time_utc < now_utc:
+                meeting_time_utc += relativedelta(weeks=1)
+            print(f"[DEBUG] Pattern '{pattern}' -> Advanced by weeks: {meeting_time_utc}")
+    else:
+        print(f"[DEBUG] Pattern '{pattern}' -> Time is in the future, no advancement needed")
+
+    print(f"[DEBUG] Pattern '{pattern}' -> Final UTC time: {meeting_time_utc}")
+    final_local = meeting_time_utc.astimezone(ZoneInfo(active_timezone))
+    print(f"[DEBUG] Pattern '{pattern}' -> Final local time: {final_local}")
 
     return {
         'original_pattern': pattern,
@@ -1200,7 +1342,9 @@ async def show_multiple_meetings_confirmation(ctx, scheduled_meetings: list, fai
             if meeting['recurrence_details']:
                 if meeting['recurrence_details']['type'] == 'specific_days':
                     day_names = {v: k.capitalize() for k, v in weekday_map.items()}
-                    day_list = [day_names[day] for day in sorted(meeting['recurrence_details']['days'])]
+                    # Sort by weekday value (0=Monday, 1=Tuesday, etc.)
+                    sorted_days = sorted(meeting['recurrence_details']['days'], key=lambda x: x.weekday)
+                    day_list = [day_names[day] for day in sorted_days]
                     day_str = ", ".join(day_list)
                     time_str = display_dt.strftime('%I:%M %p %Z')
                     meeting_descriptions.append(f"**{i+1}.** Every **{day_str}** at **{time_str}**")
@@ -1323,9 +1467,40 @@ async def schedule(ctx, *, time_text: str):
     # If the parsed date is in the past, advance to next occurrence instead of next year.
     now_utc = datetime.datetime.now(ZoneInfo("UTC"))
     if meeting_time_utc < now_utc:
-        # Instead of advancing by a year, advance by weeks until we get a future date
-        while meeting_time_utc < now_utc:
-            meeting_time_utc += relativedelta(weeks=1)
+        if recurrence_details and recurrence_details['type'] == 'specific_days':
+            # For recurring meetings, find the next occurrence of the specified day at the same time
+            # Get the time components from the original LOCAL time, not UTC
+            target_hour = meeting_time_local.hour
+            target_minute = meeting_time_local.minute
+            target_second = meeting_time_local.second
+            
+            # Start from the current time and find the next occurrence
+            next_meeting_time = now_utc.replace(hour=target_hour, minute=target_minute, second=target_second, microsecond=0)
+            
+            # If we've passed that time today, advance to the next occurrence
+            if next_meeting_time <= now_utc:
+                # Find the next occurrence of any of the specified days
+                for day_const in recurrence_details['days']:
+                    # Calculate days until next occurrence of this day
+                    current_weekday = now_utc.weekday()
+                    target_weekday = day_const.weekday
+                    days_ahead = (target_weekday - current_weekday) % 7
+                    if days_ahead == 0 and next_meeting_time <= now_utc:
+                        days_ahead = 7  # If it's the same day but time has passed, go to next week
+                    
+                    next_occurrence = now_utc + relativedelta(days=days_ahead, hour=target_hour, minute=target_minute, second=target_second, microsecond=0)
+                    if next_occurrence > now_utc:
+                        meeting_time_utc = next_occurrence
+                        break
+                else:
+                    # If no valid next occurrence found, advance by a week
+                    meeting_time_utc += relativedelta(weeks=1)
+            else:
+                meeting_time_utc = next_meeting_time
+        else:
+            # Instead of advancing by a year, advance by weeks until we get a future date
+            while meeting_time_utc < now_utc:
+                meeting_time_utc += relativedelta(weeks=1)
 
     # Convert the UTC meeting time back to the user's active timezone for a clear confirmation message.
     display_tz = ZoneInfo(active_timezone)
@@ -1338,7 +1513,9 @@ async def schedule(ctx, *, time_text: str):
         if recurrence_details['type'] == 'specific_days':
             # Create a readable list of days
             day_names = {v: k.capitalize() for k, v in weekday_map.items()}
-            day_list_str = ", ".join([day_names[day] for day in sorted(recurrence_details['days'])])
+            # Sort by weekday value (0=Monday, 1=Tuesday, etc.)
+            sorted_days = sorted(recurrence_details['days'], key=lambda x: x.weekday)
+            day_list_str = ", ".join([day_names[day] for day in sorted_days])
             
             time_str = display_dt.strftime('%I:%M %p %Z')
             date_str = display_dt.strftime('%B %d, %Y') # e.g., "July 22, 2025"
