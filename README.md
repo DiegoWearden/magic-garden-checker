@@ -1,3 +1,4 @@
+
 # 🤖 Discord Meeting Handler Bot
 
 A sophisticated Discord bot for scheduling and managing meetings with natural language processing, smart spell checking, and comprehensive meeting management features.
@@ -155,4 +156,4 @@ This project is open source and available under the [MIT License](LICENSE).
 - Built with [discord.py](https://discordpy.readthedocs.io/)
 - Natural language processing powered by [spaCy](https://spacy.io/)
 - Date parsing by [dateparser](https://dateparser.readthedocs.io/)
-- Recurring patterns handled by [python-dateutil](https://dateutil.readthedocs.io/) 
+- Recurring patterns handled by [python-dateutil](https://dateutil.readthedocs.io/)
