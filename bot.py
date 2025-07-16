@@ -1394,23 +1394,39 @@ async def schedule(ctx, *, time_text: str):
     words = time_text.lower().split()
     corrected_words = []
     for word in words:
-        # Very permissive distance calculation based on word length
-        if len(word) <= 3:
-            adaptive_max_distance = 0  # Short words must be exact
-        elif len(word) == 4:
-            adaptive_max_distance = 2  # 4-char words allow 2 errors
-        elif len(word) <= 6:
-            adaptive_max_distance = 3  # 5-6 char words allow 3 errors
-        else:
-            adaptive_max_distance = 5  # 7+ char words allow 5 errors
-        
-        best_match, _ = scheduling_trie.search_best_match(word, max_distance=adaptive_max_distance)
-
-        if best_match:
-            corrected_words.append(best_match)
-        else:
+        # Only apply spell checking to scheduling-related words, not common words
+        if word in ["make", "a", "meeting", "for", "at", "in", "on", "the", "and", "or", "to", "of", "with", "by", "from", "until", "till", "before", "after", "during", "since", "ago", "next", "last", "this", "that", "these", "those", "are", "is", "am", "was", "were", "will", "would", "could", "should"]:
             corrected_words.append(word)
+        else:
+            # Very permissive distance calculation based on word length
+            if len(word) <= 3:
+                adaptive_max_distance = 0  # Short words must be exact
+            elif len(word) == 4:
+                adaptive_max_distance = 2  # 4-char words allow 2 errors
+            elif len(word) <= 6:
+                adaptive_max_distance = 3  # 5-6 char words allow 3 errors
+            else:
+                adaptive_max_distance = 5  # 7+ char words allow 5 errors
+            
+            best_match, _ = scheduling_trie.search_best_match(word, max_distance=adaptive_max_distance)
+
+            if best_match:
+                corrected_words.append(best_match)
+            else:
+                corrected_words.append(word)
     corrected_text = " ".join(corrected_words)
+    
+    # Fix common time-related word mistakes
+    time_fixes = {
+        " are ": " at ",
+        " is ": " at ",
+        " am ": " at "
+    }
+    
+    for wrong_phrase, correct_phrase in time_fixes.items():
+        corrected_text = corrected_text.replace(wrong_phrase, correct_phrase)
+    
+    print(f"[DEBUG] Main schedule -> After time fixes: '{corrected_text}'")
 
     # --- Weekday Parsing for Complex Recurrence (using the full corrected text for context) ---
     weekday_map = {"monday": MO, "tuesday": TU, "wednesday": WE, "thursday": TH, "friday": FR, "saturday": SA, "sunday": SU}
@@ -1440,6 +1456,9 @@ async def schedule(ctx, *, time_text: str):
 
     # We now pass the entire corrected text to search_dates, making it more robust.
     current_time = datetime.datetime.now(ZoneInfo(active_timezone))
+    print(f"[DEBUG] Main schedule -> Attempting to parse: '{corrected_text}'")
+    print(f"[DEBUG] Main schedule -> Current time: {current_time}")
+    
     found_dates = search_dates(
         corrected_text,
         settings={
@@ -1449,6 +1468,8 @@ async def schedule(ctx, *, time_text: str):
             'RELATIVE_BASE': current_time
         }
     )
+    
+    print(f"[DEBUG] Main schedule -> search_dates result: {found_dates}")
     
     if not found_dates:
         await ctx.send("I couldn't understand the time. Please try something like 'tomorrow at 3pm' or 'in 2 hours'.")
@@ -1498,9 +1519,14 @@ async def schedule(ctx, *, time_text: str):
             else:
                 meeting_time_utc = next_meeting_time
         else:
-            # Instead of advancing by a year, advance by weeks until we get a future date
-            while meeting_time_utc < now_utc:
-                meeting_time_utc += relativedelta(weeks=1)
+            # For one-time meetings, if the time has passed, don't schedule it
+            # Instead, tell the user the time has passed
+            if meeting_time_utc < now_utc:
+                display_tz = ZoneInfo(active_timezone)
+                display_dt = meeting_time_local
+                display_time_str = display_dt.strftime('%A, %B %d, %Y at %I:%M %p %Z')
+                await ctx.send(f"That time has already passed. You requested **{display_time_str}** but it's now **{datetime.datetime.now(display_tz).strftime('%I:%M %p %Z')}**.")
+                return
 
     # Convert the UTC meeting time back to the user's active timezone for a clear confirmation message.
     display_tz = ZoneInfo(active_timezone)
@@ -1578,7 +1604,8 @@ async def check_meeting_reminders():
                 reminder_time = meeting_time - datetime.timedelta(hours=1)
                 reminder_key = f"{meeting['id']}_onetime"
                 
-                if reminder_time <= now < meeting_time and reminder_key not in sent_reminders:
+                # Only send reminder if we're within 1 minute of the reminder time and haven't sent it yet
+                if (reminder_time - datetime.timedelta(minutes=1)) <= now <= (reminder_time + datetime.timedelta(minutes=1)) and reminder_key not in sent_reminders:
                     channel = bot.get_channel(meeting['channel_id'])
                     if channel:
                         unix_timestamp = int(meeting_time.timestamp())
@@ -1598,7 +1625,8 @@ async def check_meeting_reminders():
                     reminder_time = instance_time - datetime.timedelta(hours=1)
                     reminder_key = f"{meeting['id']}_{instance_time.isoformat()}"
                     
-                    if reminder_time <= now < instance_time and reminder_key not in sent_reminders:
+                    # Only send reminder if we're within 1 minute of the reminder time and haven't sent it yet
+                    if (reminder_time - datetime.timedelta(minutes=1)) <= now <= (reminder_time + datetime.timedelta(minutes=1)) and reminder_key not in sent_reminders:
                         # Check if this instance has been cancelled
                         exception = get_meeting_exception(meeting['id'], instance_time)
                         if exception and exception['type'] == 'cancelled':
@@ -1610,7 +1638,7 @@ async def check_meeting_reminders():
                             actual_meeting_time = exception['new_time']
                             # Recalculate reminder time for rescheduled meetings
                             reminder_time = actual_meeting_time - datetime.timedelta(hours=1)
-                            if not (reminder_time <= now < actual_meeting_time):
+                            if not ((reminder_time - datetime.timedelta(minutes=1)) <= now <= (reminder_time + datetime.timedelta(minutes=1))):
                                 continue
                         
                         channel = bot.get_channel(meeting['channel_id'])
