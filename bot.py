@@ -797,9 +797,11 @@ class RescheduleModal(discord.ui.Modal, title="Reschedule Meeting"):
         # Use the same weekday parsing logic as the main schedule command
         weekday_map = {"monday": MO, "tuesday": TU, "wednesday": WE, "thursday": TH, "friday": FR, "saturday": SA, "sunday": SU}
         found_day_consts = set()
-        for day_str, day_const in weekday_map.items():
-            if re.search(r'\b' + day_str + r'\b', corrected_text):
-                found_day_consts.add(day_const)
+        for correct_day, day_const in weekday_map.items():
+            for day_variant in weekday_misspellings[correct_day]:
+                if re.search(r'\b' + day_variant + r'\b', corrected_text):
+                    found_day_consts.add(day_const)
+                    break  # Found this day, move to next
         found_weekdays = list(found_day_consts)
 
         # Determine if this should be recurring (same logic as main schedule command)
@@ -1054,14 +1056,27 @@ async def handle_multiple_meetings(ctx, time_text: str, author_id: str, active_t
     # Check if this is a single recurring pattern with multiple days (e.g., "every saturday and sunday at 7pm")
     weekday_map = {"monday": MO, "tuesday": TU, "wednesday": WE, "thursday": TH, "friday": FR, "saturday": SA, "sunday": SU}
     
+    # Common misspellings of weekdays
+    weekday_misspellings = {
+        "monday": ["monday"],
+        "tuesday": ["tuesday", "tues", "tue"],
+        "wednesday": ["wednesday", "wensday", "weds", "wed"],
+        "thursday": ["thursday", "thurs", "thur", "thu"],
+        "friday": ["friday", "fri"],
+        "saturday": ["saturday", "sat"],
+        "sunday": ["sunday", "sun"]
+    }
+
     # Look for patterns like "every [day] and [day] at [time]" or "every [day], [day] at [time]"
     import re
     
     # Check if the text contains multiple days with a single time
     found_days = []
-    for day_str in weekday_map.keys():
-        if re.search(r'\b' + day_str + r'\b', clean_text):
-            found_days.append(day_str)
+    for correct_day, variations in weekday_misspellings.items():
+        for day_variant in variations:
+            if re.search(r'\b' + day_variant + r'\b', clean_text):
+                found_days.append(correct_day)
+                break  # Found this day, move to next
     
     # If we found multiple days and there's a recurring keyword, create separate meetings for each day
     if len(found_days) > 1 and ("every" in clean_text or "weekly" in clean_text or "recurring" in clean_text):
@@ -1084,13 +1099,14 @@ async def handle_multiple_meetings(ctx, time_text: str, author_id: str, active_t
             single_day_pattern = processed_text
             for other_day in found_days:
                 if other_day != day:
-                    # Remove other days from the pattern
-                    single_day_pattern = single_day_pattern.replace(f" and {other_day}", "")
-                    single_day_pattern = single_day_pattern.replace(f"{other_day} and ", "")
-                    single_day_pattern = single_day_pattern.replace(f", {other_day}", "")
-                    single_day_pattern = single_day_pattern.replace(f"{other_day}, ", "")
-                    single_day_pattern = single_day_pattern.replace(other_day, "")
-            
+                    # Remove other days from the pattern (including misspellings)
+                    for other_day_variant in weekday_misspellings[other_day]:
+                        single_day_pattern = single_day_pattern.replace(f" and {other_day_variant}", "")
+                        single_day_pattern = single_day_pattern.replace(f"{other_day_variant} and ", "")
+                        single_day_pattern = single_day_pattern.replace(f", {other_day_variant}", "")
+                        single_day_pattern = single_day_pattern.replace(f"{other_day_variant}, ", "")
+                        single_day_pattern = single_day_pattern.replace(other_day_variant, "")
+
             # Clean up any double spaces and trim
             single_day_pattern = " ".join(single_day_pattern.split())
             meeting_patterns.append(single_day_pattern)
@@ -1115,15 +1131,14 @@ async def handle_multiple_meetings(ctx, time_text: str, author_id: str, active_t
         await show_multiple_meetings_confirmation(ctx, scheduled_meetings, failed_meetings)
         return
     
-    # Split by "and" and commas, handling both
-    # Split by comma or " and " while preserving the content
-    parts = re.split(r',\s*(?:and\s+)?|(?:\s+and\s+)', clean_text)
+    # Split by commas first, then handle "and" within each part
+    comma_parts = clean_text.split(',')
     
     # Clean up each part and remove prefixes from each individual pattern
     meeting_patterns = []
     prefixes_to_remove = ["make a meeting for", "schedule a meeting for", "make meetings for", "schedule meetings for", "make a meeting", "schedule a meeting"]
     
-    for part in parts:
+    for part in comma_parts:
         part = part.strip()
         if part:  # Skip empty parts
             # Remove prefixes from each individual pattern
@@ -1131,7 +1146,16 @@ async def handle_multiple_meetings(ctx, time_text: str, author_id: str, active_t
                 if part.startswith(prefix):
                     part = part[len(prefix):].strip()
                     break
-            meeting_patterns.append(part)
+            
+            # Handle "and" within this part - split if it contains "and"
+            if " and " in part:
+                and_parts = part.split(" and ")
+                for and_part in and_parts:
+                    and_part = and_part.strip()
+                    if and_part:  # Skip empty parts
+                        meeting_patterns.append(and_part)
+            else:
+                meeting_patterns.append(part)
 
     print(f"[DEBUG] Meeting patterns to process: {meeting_patterns}")
     
@@ -1182,10 +1206,24 @@ async def process_single_meeting_pattern(pattern: str, author_id: str, active_ti
     
     # Parse weekdays and recurrence (same logic as main function)
     weekday_map = {"monday": MO, "tuesday": TU, "wednesday": WE, "thursday": TH, "friday": FR, "saturday": SA, "sunday": SU}
+    
+    # Common misspellings of weekdays
+    weekday_misspellings = {
+        "monday": ["monday"],
+        "tuesday": ["tuesday", "tues", "tue"],
+        "wednesday": ["wednesday", "wensday", "weds", "wed"],
+        "thursday": ["thursday", "thurs", "thur", "thu"],
+        "friday": ["friday", "fri"],
+        "saturday": ["saturday", "sat"],
+        "sunday": ["sunday", "sun"]
+    }
+    
     found_day_consts = set()
-    for day_str, day_const in weekday_map.items():
-        if re.search(r'\b' + day_str + r'\b', corrected_text):
-            found_day_consts.add(day_const)
+    for correct_day, day_const in weekday_map.items():
+        for day_variant in weekday_misspellings[correct_day]:
+            if re.search(r'\b' + day_variant + r'\b', corrected_text):
+                found_day_consts.add(day_const)
+                break  # Found this day, move to next
     found_weekdays = list(found_day_consts)
 
     # Determine if this should be recurring
@@ -1209,15 +1247,19 @@ async def process_single_meeting_pattern(pattern: str, author_id: str, active_ti
     parse_text = corrected_text
     if len(found_weekdays) > 1:
         # Replace "day1 and day2" with just "day1" for time parsing
-        for day_str in weekday_map.keys():
-            if day_str in corrected_text:
-                # Use the first day found for time parsing
-                parse_text = corrected_text.replace(" and ", " ").replace(", ", " ")
-                # Remove all days except the first one
-                for other_day in weekday_map.keys():
-                    if other_day != day_str and other_day in parse_text:
-                        parse_text = parse_text.replace(other_day, "")
-                parse_text = parse_text.replace("  ", " ").strip()
+        for correct_day in weekday_map.keys():
+            for day_variant in weekday_misspellings[correct_day]:
+                if day_variant in corrected_text:
+                    # Use the first day found for time parsing
+                    parse_text = corrected_text.replace(" and ", " ").replace(", ", " ")
+                    # Remove all days except the first one (including misspellings)
+                    for other_correct_day in weekday_map.keys():
+                        if other_correct_day != correct_day:
+                            for other_day_variant in weekday_misspellings[other_correct_day]:
+                                parse_text = parse_text.replace(other_day_variant, "")
+                    parse_text = parse_text.replace("  ", " ").strip()
+                    break
+            if parse_text != corrected_text:  # If we found and processed a day, break
                 break
     
     print(f"[DEBUG] Pattern '{pattern}' -> Attempting to parse: '{parse_text}'")
@@ -1300,7 +1342,7 @@ async def process_single_meeting_pattern(pattern: str, author_id: str, active_ti
             # For non-recurring or simple weekly meetings, use the original logic
             while meeting_time_utc < now_utc:
                 meeting_time_utc += relativedelta(weeks=1)
-            print(f"[DEBUG] Pattern '{pattern}' -> Advanced by weeks: {meeting_time_utc}")
+                print(f"[DEBUG] Pattern '{pattern}' -> Advanced by weeks: {meeting_time_utc}")
     else:
         print(f"[DEBUG] Pattern '{pattern}' -> Time is in the future, no advancement needed")
 
@@ -1391,11 +1433,23 @@ async def schedule(ctx, *, time_text: str):
         return
 
     # --- Pre-process to correct misspellings of weekdays ---
-    words = time_text.lower().split()
+    # First, preserve time patterns like "12:00pm" by temporarily replacing them
+    import re
+    
+    # Find and temporarily replace time patterns
+    time_patterns = []
+    def replace_time(match):
+        time_patterns.append(match.group(0))
+        return f"__TIME_{len(time_patterns)-1}__"
+    
+    # Look for patterns like "12:00pm", "3:30am", "6pm", etc.
+    processed_text = re.sub(r'\d{1,2}:\d{2}(?:am|pm)|\d{1,2}(?:am|pm)', replace_time, time_text.lower())
+    
+    words = processed_text.split()
     corrected_words = []
     for word in words:
         # Only apply spell checking to scheduling-related words, not common words
-        if word in ["make", "a", "meeting", "for", "at", "in", "on", "the", "and", "or", "to", "of", "with", "by", "from", "until", "till", "before", "after", "during", "since", "ago", "next", "last", "this", "that", "these", "those", "are", "is", "am", "was", "were", "will", "would", "could", "should"]:
+        if word in ["make", "a", "meeting", "for", "at", "in", "on", "the", "and", "or", "to", "of", "with", "by", "from", "until", "till", "before", "after", "during", "since", "ago", "next", "last", "this", "that", "these", "those", "are", "is", "am", "was", "were", "will", "would", "could", "should", "pm", "am"]:
             corrected_words.append(word)
         else:
             # Very permissive distance calculation based on word length
@@ -1416,6 +1470,12 @@ async def schedule(ctx, *, time_text: str):
                 corrected_words.append(word)
     corrected_text = " ".join(corrected_words)
     
+    # Restore the original time patterns
+    for i, time_pattern in enumerate(time_patterns):
+        corrected_text = corrected_text.replace(f"__TIME_{i}__", time_pattern)
+    
+    print(f"[DEBUG] Main schedule -> After spell checking: '{corrected_text}'")
+    
     # Fix common time-related word mistakes
     time_fixes = {
         " are ": " at ",
@@ -1430,10 +1490,24 @@ async def schedule(ctx, *, time_text: str):
 
     # --- Weekday Parsing for Complex Recurrence (using the full corrected text for context) ---
     weekday_map = {"monday": MO, "tuesday": TU, "wednesday": WE, "thursday": TH, "friday": FR, "saturday": SA, "sunday": SU}
+    
+    # Common misspellings of weekdays
+    weekday_misspellings = {
+        "monday": ["monday"],
+        "tuesday": ["tuesday", "tues", "tue"],
+        "wednesday": ["wednesday", "wensday", "weds", "wed"],
+        "thursday": ["thursday", "thurs", "thur", "thu"],
+        "friday": ["friday", "fri"],
+        "saturday": ["saturday", "sat"],
+        "sunday": ["sunday", "sun"]
+    }
+    
     found_day_consts = set()
-    for day_str, day_const in weekday_map.items():
-        if re.search(r'\b' + day_str + r'\b', corrected_text):
-            found_day_consts.add(day_const)
+    for correct_day, day_const in weekday_map.items():
+        for day_variant in weekday_misspellings[correct_day]:
+            if re.search(r'\b' + day_variant + r'\b', corrected_text):
+                found_day_consts.add(day_const)
+                break  # Found this day, move to next
     found_weekdays = list(found_day_consts)
 
     # --- Determine Recurrence ---
@@ -1476,6 +1550,7 @@ async def schedule(ctx, *, time_text: str):
         return
 
     _, meeting_time_local = found_dates[0]
+    print(f"[DEBUG] Main schedule -> Parsed local time: {meeting_time_local}")
 
     # Convert from user timezone to UTC for storage
     if meeting_time_local.tzinfo is None:
@@ -1483,11 +1558,15 @@ async def schedule(ctx, *, time_text: str):
         meeting_time_local = meeting_time_local.replace(tzinfo=ZoneInfo(active_timezone))
     
     meeting_time_utc = meeting_time_local.astimezone(ZoneInfo("UTC"))
+    print(f"[DEBUG] Main schedule -> UTC time: {meeting_time_utc}")
     
     # --- Manually handle dates in the past ---
     # If the parsed date is in the past, advance to next occurrence instead of next year.
     now_utc = datetime.datetime.now(ZoneInfo("UTC"))
+    print(f"[DEBUG] Main schedule -> Current UTC: {now_utc}")
+    
     if meeting_time_utc < now_utc:
+        print(f"[DEBUG] Main schedule -> Time is in the past, checking advancement logic...")
         if recurrence_details and recurrence_details['type'] == 'specific_days':
             # For recurring meetings, find the next occurrence of the specified day at the same time
             # Get the time components from the original LOCAL time, not UTC
@@ -1601,16 +1680,30 @@ async def check_meeting_reminders():
             if meeting.get('type') == 'one-time':
                 # Handle one-time meetings
                 meeting_time = meeting['time'].replace(tzinfo=ZoneInfo("UTC"))
-                reminder_time = meeting_time - datetime.timedelta(hours=1)
-                reminder_key = f"{meeting['id']}_onetime"
                 
-                # Only send reminder if we're within 1 minute of the reminder time and haven't sent it yet
-                if (reminder_time - datetime.timedelta(minutes=1)) <= now <= (reminder_time + datetime.timedelta(minutes=1)) and reminder_key not in sent_reminders:
+                # Check for 1-hour reminder
+                reminder_time_1h = meeting_time - datetime.timedelta(hours=1)
+                reminder_key_1h = f"{meeting['id']}_onetime_1h"
+                
+                # Check for 5-minute reminder
+                reminder_time_5m = meeting_time - datetime.timedelta(minutes=5)
+                reminder_key_5m = f"{meeting['id']}_onetime_5m"
+                
+                # Send 1-hour reminder
+                if (reminder_time_1h - datetime.timedelta(minutes=1)) <= now <= (reminder_time_1h + datetime.timedelta(minutes=1)) and reminder_key_1h not in sent_reminders:
                     channel = bot.get_channel(meeting['channel_id'])
                     if channel:
                         unix_timestamp = int(meeting_time.timestamp())
-                        await channel.send(f"**⏰ REMINDER:** The meeting scheduled by {meeting['requester']} is starting <t:{unix_timestamp}:R>!")
-                        sent_reminders.add(reminder_key)
+                        await channel.send(f"**⏰ REMINDER (1 hour):** The meeting scheduled by {meeting['requester']} is starting <t:{unix_timestamp}:R>!")
+                        sent_reminders.add(reminder_key_1h)
+                
+                # Send 5-minute reminder
+                if (reminder_time_5m - datetime.timedelta(minutes=1)) <= now <= (reminder_time_5m + datetime.timedelta(minutes=1)) and reminder_key_5m not in sent_reminders:
+                    channel = bot.get_channel(meeting['channel_id'])
+                    if channel:
+                        unix_timestamp = int(meeting_time.timestamp())
+                        await channel.send(f"**🚨 FINAL REMINDER (5 minutes):** The meeting scheduled by {meeting['requester']} is starting <t:{unix_timestamp}:R>!")
+                        sent_reminders.add(reminder_key_5m)
                 
                 # Remove old one-time meetings
                 elif now > meeting_time + datetime.timedelta(hours=1):
@@ -1622,41 +1715,59 @@ async def check_meeting_reminders():
                 instances = get_next_meeting_instances(meeting, from_time=now, limit=5)
                 
                 for instance_time in instances:
-                    reminder_time = instance_time - datetime.timedelta(hours=1)
-                    reminder_key = f"{meeting['id']}_{instance_time.isoformat()}"
+                    # Check for 1-hour reminder
+                    reminder_time_1h = instance_time - datetime.timedelta(hours=1)
+                    reminder_key_1h = f"{meeting['id']}_{instance_time.isoformat()}_1h"
                     
-                    # Only send reminder if we're within 1 minute of the reminder time and haven't sent it yet
-                    if (reminder_time - datetime.timedelta(minutes=1)) <= now <= (reminder_time + datetime.timedelta(minutes=1)) and reminder_key not in sent_reminders:
+                    # Check for 5-minute reminder
+                    reminder_time_5m = instance_time - datetime.timedelta(minutes=5)
+                    reminder_key_5m = f"{meeting['id']}_{instance_time.isoformat()}_5m"
+                    
                         # Check if this instance has been cancelled
-                        exception = get_meeting_exception(meeting['id'], instance_time)
-                        if exception and exception['type'] == 'cancelled':
-                            continue  # Skip cancelled instances
-                        
+                    exception = get_meeting_exception(meeting['id'], instance_time)
+                    if exception and exception['type'] == 'cancelled':
+                        continue  # Skip cancelled instances
+                    
                         # For rescheduled instances, use the new time
                         actual_meeting_time = instance_time
                         if exception and exception['type'] == 'rescheduled':
                             actual_meeting_time = exception['new_time']
-                            # Recalculate reminder time for rescheduled meetings
-                            reminder_time = actual_meeting_time - datetime.timedelta(hours=1)
-                            if not ((reminder_time - datetime.timedelta(minutes=1)) <= now <= (reminder_time + datetime.timedelta(minutes=1))):
-                                continue
-                        
+                        # Recalculate reminder times for rescheduled meetings
+                        reminder_time_1h = actual_meeting_time - datetime.timedelta(hours=1)
+                        reminder_time_5m = actual_meeting_time - datetime.timedelta(minutes=5)
+                    
+                    # Send 1-hour reminder
+                    if (reminder_time_1h - datetime.timedelta(minutes=1)) <= now <= (reminder_time_1h + datetime.timedelta(minutes=1)) and reminder_key_1h not in sent_reminders:
                         channel = bot.get_channel(meeting['channel_id'])
                         if channel:
                             unix_timestamp = int(actual_meeting_time.timestamp())
-                            message = f"**⏰ REMINDER:** The recurring meeting scheduled by {meeting['requester']} is starting <t:{unix_timestamp}:R>!"
+                            message = f"**⏰ REMINDER (1 hour):** The recurring meeting scheduled by {meeting['requester']} is starting <t:{unix_timestamp}:R>!"
                             
                             # Add note if this instance was rescheduled
                             if exception and exception['type'] == 'rescheduled':
                                 message += " *(This instance was rescheduled)*"
                             
                             await channel.send(message)
-                            sent_reminders.add(reminder_key)
+                            sent_reminders.add(reminder_key_1h)
+                    
+                    # Send 5-minute reminder
+                    if (reminder_time_5m - datetime.timedelta(minutes=1)) <= now <= (reminder_time_5m + datetime.timedelta(minutes=1)) and reminder_key_5m not in sent_reminders:
+                        channel = bot.get_channel(meeting['channel_id'])
+                        if channel:
+                            unix_timestamp = int(actual_meeting_time.timestamp())
+                            message = f"**🚨 FINAL REMINDER (5 minutes):** The recurring meeting scheduled by {meeting['requester']} is starting <t:{unix_timestamp}:R>!"
+                            
+                            # Add note if this instance was rescheduled
+                            if exception and exception['type'] == 'rescheduled':
+                                message += " *(This instance was rescheduled)*"
+                            
+                            await channel.send(message)
+                            sent_reminders.add(reminder_key_5m)
         
         # Clean up old reminder keys (older than 24 hours) to prevent memory buildup
         current_time_str = now.isoformat()
         sent_reminders = {key for key in sent_reminders 
-                         if not (key.endswith("_onetime") or 
+                         if not (key.endswith("_onetime_1h") or key.endswith("_onetime_5m") or 
                                 key.split("_", 1)[1] < (now - datetime.timedelta(days=1)).isoformat())}
         
         await asyncio.sleep(60)
