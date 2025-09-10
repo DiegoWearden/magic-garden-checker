@@ -236,23 +236,23 @@ async def cmd_help(ctx):
     embed = discord.Embed(title="Magic Garden Checker — Commands", color=0x2ecc71)
     embed.description = "Use these commands to inspect the shop page, control the periodic checker, and change the rarity threshold. Owner-only commands require the bot owner."
 
-    owner_cmds = (
-        "!set_threshold <rarity> — Set notification threshold (common, uncommon, rare, epic, legendary, mythic)\n"
-        "!start_periodic_check [minutes] — Start periodic scans (default uses built-in interval)\n"
-        "!stop_periodic_check — Stop the periodic scanner\n"
-        "!run_seed_check — Run an immediate one-off scan"
-    )
+    # Build nicer-formatted command lists using inline code for commands and short descriptions
+    owner_cmds_lines = [
+        "`!set_threshold <rarity>` — Set notification threshold (common, uncommon, rare, epic, legendary, mythic)",
+        "`!start_periodic_check [minutes]` — Start periodic scans (default uses built-in interval)",
+        "`!stop_periodic_check` — Stop the periodic scanner",
+        "`!run_seed_check` — Run an immediate one-off scan",
+        "`!set_plant_threshold <plant name>` — Use the specified plant's rarity as the threshold (owner only)",
+        "`!clear_plant_threshold` — Clear the plant-based threshold and use rarity threshold instead",
+    ]
 
-    owner_cmds += (
-        "\n!set_plant_threshold <plant name> — Use the specified plant's rarity as the threshold (owner only)\n"
-        "!clear_plant_threshold — Clear the plant-based threshold and use rarity threshold instead\n"
-    )
-
-    utility_cmds = (
-        "!current_html [index] [endpoint] — Return page HTML for debugging\n"
-        "!screenshot [index] [full] [endpoint] — Capture a screenshot (use 'true' for full)\n"
-        "!in_stock [index] [endpoint] — List items detected as in-stock"
-    )
+    utility_cmds_lines = [
+        "`!check_threshold [index] [endpoint] [\"Plant Name\"]` — Show current threshold configuration and optionally inspect a plant on a page",
+        "`!current_html [index] [endpoint]` — Return page HTML for debugging",
+        "`!screenshot [index] [full] [endpoint]` — Capture a screenshot (use 'true' for full)",
+        "`!in_stock [index] [endpoint]` — List items detected as in-stock",
+        "`!list_plants` — Fetch current plant/item names from the open page",
+    ]
 
     notes = (
         "• The bot attaches to an external Chromium via CDP (CDP_DEFAULT).\n"
@@ -261,8 +261,9 @@ async def cmd_help(ctx):
         "• Owner commands require the bot owner to run them."
     )
 
-    embed.add_field(name="Owner-only commands", value=f"```\n{owner_cmds}\n```", inline=False)
-    embed.add_field(name="Utility commands", value=f"```\n{utility_cmds}\n```", inline=False)
+    # Show owner and utility commands as separate embed fields with nicer formatting
+    embed.add_field(name="Owner-only commands", value="\n".join(owner_cmds_lines), inline=False)
+    embed.add_field(name="Utility commands", value="\n".join(utility_cmds_lines), inline=False)
     embed.add_field(name="Notes", value=notes, inline=False)
 
     # The bot discovers plant names dynamically from the site. Use !list_plants to fetch
