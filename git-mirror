@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# git-mirror: helper to add/commit/push to origin and a mirror remote.
+# Usage examples:
+#   ./git-mirror add .
+#   ./git-mirror commit -m "your message"
+#   ./git-mirror push            # pushes current branch to origin and to mirror:main
+#   ./git-mirror push --force    # force-push to mirror:main
+# Environment variables:
+#   MIRROR_REMOTE - name of the mirror remote (default: mirror)
+#   ORIGIN_REMOTE - name of the primary remote (default: origin)
+#   FORCE=1        - make push to mirror forceful (same as --force)
+
+MIRROR_REMOTE="${MIRROR_REMOTE:-mirror}"
+ORIGIN_REMOTE="${ORIGIN_REMOTE:-origin}"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 {add|commit|push|status} [args...]"
+  exit 2
+fi
+
+cmd="$1"
+shift || true
+
+case "$cmd" in
+  add)
+    if [ $# -eq 0 ]; then
+      echo "Usage: $0 add <path>..."
+      exit 2
+    fi
+    git add "$@"
+    ;;
+
+  commit)
+    # Support: ./git-mirror commit -m "message"
+    if [ "$#" -ge 2 ] && [ "$1" = "-m" ]; then
+      shift
+      msg="$*"
+      git commit -m "$msg"
+    else
+      # Forward any other commit args
+      git commit "$@"
+    fi
+    ;;
+
+  push)
+    # Determine current branch
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    force_flag=""
+    if [ "${1:-}" = "--force" ] || [ "${FORCE:-}" = "1" ]; then
+      force_flag="--force"
+    fi
+
+    echo "Pushing to ${ORIGIN_REMOTE}/${branch}..."
+    git push "$ORIGIN_REMOTE" "$branch"
+
+    echo "Pushing to ${MIRROR_REMOTE}/main (from ${branch}) ${force_flag}..."
+    # push local branch to mirror main; include force if requested
+    if [ -n "$force_flag" ]; then
+      git push --force "$MIRROR_REMOTE" "$branch:main"
+    else
+      git push "$MIRROR_REMOTE" "$branch:main"
+    fi
+    ;;
+
+  status)
+    git status
+    ;;
+
+  *)
+    echo "Unknown command: $cmd"
+    echo "Usage: $0 {add|commit|push|status} [args...]"
+    exit 2
+    ;;
+esac
