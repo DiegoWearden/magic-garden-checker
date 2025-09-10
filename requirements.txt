@@ -1,8 +1,8 @@
-discord.py
-python-dotenv
-playwright
+discord.py>=2.2.3
+python-dotenv>=0.21.0
+playwright>=1.28.0
+tzdata>=2023.3
 dateparser
-tzdata
 python-dateutil
 spacy
 requests

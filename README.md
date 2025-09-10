@@ -1,16 +1,21 @@
-# Meeting Handler Bot
+# Magic Garden Checker
 
-Lightweight Discord bot that fetches and returns rendered HTML for a target webpage (default: https://magiccircle.gg/r/LDQK).
+A small Discord bot that attaches to a user-managed Chromium via CDP and watches the Magic Garden shop page for items and restocks. It can run one-off checks, periodic scans, and send automatic alerts when items matching configured filters are detected.
 
-## Requirements
+Features
+- Attach to an external Chromium/Chrome/Chromium-based browser via CDP (no embedded browser launched automatically).
+- One-off checks: fetch page HTML, screenshot, list in-stock items.
+- Periodic scans with optional schedule (interpreted in America/Chicago timezone).
+- Automatic notifications for items that are in-stock and meet a rarity threshold (deduped so you only get alerts on new items).
+- Owner-only control commands for starting/stopping scans and changing thresholds.
 
-- Python 3.8+
-- A Discord bot token (set in .env as `DISCORD_TOKEN`)
-- Debian/Ubuntu/Raspberry Pi OS: system libraries required by Playwright (see Troubleshooting)
+Prerequisites
+- Python 3.9+ (ZoneInfo used)
+- An external Chromium/Chrome running with remote debugging enabled (or Playwright browsers with a CDP endpoint)
+- A Discord bot token and the bot invited to your server with send_messages permission
 
-## Setup
-
-1. Create and activate a virtual environment:
+Install
+1. Create a virtualenv and activate it:
 
    python -m venv venv
    source venv/bin/activate
@@ -19,57 +24,76 @@ Lightweight Discord bot that fetches and returns rendered HTML for a target webp
 
    pip install -r requirements.txt
 
-3. Install Playwright system dependencies and browsers:
+3. If you installed Playwright via pip and want to use Playwright browsers, run:
 
-   # Install OS-level dependencies recommended by Playwright
-   sudo playwright install-deps
+   playwright install
 
-   # Install browser binaries into the project cache
-   PLAYWRIGHT_BROWSERS_PATH=./.playwright-cache playwright install chromium
+Run a Chromium instance for CDP (example using Chrome/Chromium):
 
-   If you prefer the default cache location, run `playwright install` without `PLAYWRIGHT_BROWSERS_PATH`.
+- Google Chrome / Chromium:
 
-4. Create a `.env` file with your Discord token:
+  google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-cdp &
 
-   DISCORD_TOKEN=your_bot_token_here
+This makes a CDP endpoint available at http://127.0.0.1:9222 (the default the bot uses).
 
-5. Ensure the headless binary is executable (if using project cache):
+Configuration
+Create a .env file in the project directory with at least:
 
-   chmod +x ./.playwright-cache/chromium_headless_shell-*/chrome-linux/headless_shell
+DISCORD_TOKEN=your_bot_token_here
+# Optional overrides
+CDP_DEFAULT=http://127.0.0.1:9222
+RESTOCK_RARITY_THRESHOLD=mythic
 
-## Run
+Key settings
+- DISCORD_TOKEN: required. The bot token used to log in.
+- CDP_DEFAULT: the CDP endpoint to attach to (default: http://127.0.0.1:9222).
+- RESTOCK_RARITY_THRESHOLD: default rarity threshold for automatic alerts (common, uncommon, rare, epic, legendary, mythic).
 
-With the virtual environment active:
+Usage
+Start the bot normally:
 
    python bot.py
 
-## Bot commands
+Start the bot and schedule the periodic checker to start at a Chicago time:
 
-- `!fetch_html [url]` - Renders the page (default URL is defined by `TARGET_URL` or the built-in default) and returns HTML. If the page is large, it sends a `page.html` file.
-- `!ping` - Replies `pong`.
+   python bot.py --periodic-start 10:37:01pm
 
-## Configuration
+(Startup schedule is interpreted as America/Chicago time and converted to the host clock.)
 
-- Set `TARGET_URL` in `.env` to change the default URL.
-- The code sets the environment variable `PLAYWRIGHT_BROWSERS_PATH` to `./.playwright-cache` so Playwright uses the local cache when available.
+Discord commands
+- !help
+  Show help (lists commands and usage).
 
-## Troubleshooting
+Owner-only commands
+- !set_threshold <rarity>
+  Set the restock rarity threshold. Valid: common, uncommon, rare, epic, legendary, mythic
+- !start_periodic_check [minutes]
+  Start periodic scans every X minutes (default 5).
+- !stop_periodic_check
+  Stop the periodic scanner.
+- !run_seed_check
+  Run a one-off immediate scan and (if matches) send alerts.
 
-- If Playwright complains about missing libraries, run:
+Utility commands (anyone)
+- !current_html [index] [endpoint]
+  Return HTML of the attached page (index defaults to 0). Useful for debugging selectors.
+- !screenshot [index] [full] [endpoint]
+  Take a screenshot. Use `true` for full-page capture.
+- !in_stock [index] [endpoint]
+  List items currently detected as in-stock on the selected page.
 
-  sudo playwright install-deps
+Behavior notes
+- The bot attaches to an external browser tab. Make sure the shop page is open in that browser.
+- Notifications are deduped per-page; the bot remembers which item names have already triggered alerts and will only notify again when new names appear. Restarting the bot clears in-memory state.
+- If you need the bot to always notify (even for the same items), ask to add a command to clear the dedupe cache or to disable dedupe.
 
-  or install specific packages reported by the installer using `apt`.
+Troubleshooting
+- If the scheduled start appears to be many hours away, check the host clock/timezone. The scheduled input is interpreted in America/Chicago. Run `date` or `timedatectl status` on the host to verify.
+- If no items are detected, run `!current_html` or `!screenshot` and inspect the output; selectors are based on button.chakra-button and p.chakra-text.css-swfl2y.
+- If the bot cannot attach to CDP, ensure Chrome is running with --remote-debugging-port and CDP_DEFAULT matches the endpoint.
 
-- If Playwright cannot find the executable, ensure the environment variable is set before starting the bot:
+Development notes
+- The bot uses the Playwright CDP connector to attach to an external browser. You can also use a Playwright-launched browser and expose its CDP endpoint.
 
-  export PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-cache"
-  python bot.py
-
-- If you get permission errors when installing browsers globally with `sudo`, use the project cache method shown above.
-
-- Make sure the bot has the "Message Content Intent" enabled in the Discord Developer Portal and that the bot has permissions to read and send messages in the server.
-
-## License
-
-No license specified.
+License
+- This repository contains user-specific scripts and is provided as-is. Modify at your own risk.
