@@ -122,8 +122,73 @@ PERIODIC_INTERVAL_SECONDS = 300
 # - If False, notify every scan as long as threshold-passing items are present.
 NOTIFY_ON_NEW_ONLY = False
 
+# Plant-based threshold (if set, use the rarity of this plant as the threshold)
+PLANT_THRESHOLD_NAME = None
+
 # Print configured threshold on startup for visibility
 print(f"Restock rarity threshold: {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
+
+# Canonical full ordering of items (lowest -> highest). Use this for position-based plant thresholds.
+FULL_ORDER = [
+    "Carrot Seed",
+    "Strawberry Seed",
+    "Aloe Seed",
+    "Blueberry Seed",
+    "Apple Seed",
+    "Tulip Seed",
+    "Tomato Seed",
+    "Daffodil Seed",
+    "Corn Kernel",
+    "Watermelon Seed",
+    "Pumpkin Seed",
+    "Echeveria Cutting",
+    "Coconut Seed",
+    "Banana Seed",
+    "Lily Seed",
+    "Burro's Tail Cutting",
+    "Mushroom Spore",
+    "Cactus Seed",
+    "Bamboo Seed",
+    "Grape Seed",
+    "Pepper Seed",
+    "Lemon Seed",
+    "Passion Fruit Seed",
+    "Dragon Fruit Seed",
+    "Lychee Pit",
+    "Sunflower Seed",
+    "Starweaver Pod",
+]
+
+# Friendly rarity labels for known items (used by list_plants and for logging)
+RARITY_MAP = {
+    "Carrot Seed": "Common",
+    "Strawberry Seed": "Common",
+    "Aloe Seed": "Common",
+    "Blueberry Seed": "Uncommon",
+    "Apple Seed": "Uncommon",
+    "Tulip Seed": "Uncommon",
+    "Tomato Seed": "Uncommon",
+    "Daffodil Seed": "Rare",
+    "Corn Kernel": "Rare",
+    "Watermelon Seed": "Rare",
+    "Pumpkin Seed": "Rare",
+    "Echeveria Cutting": "Legendary",
+    "Coconut Seed": "Legendary",
+    "Banana Seed": "Legendary",
+    "Lily Seed": "Legendary",
+    "Burro's Tail Cutting": "Legendary",
+    "Mushroom Spore": "Mythical",
+    "Cactus Seed": "Mythical",
+    "Bamboo Seed": "Mythical",
+    "Grape Seed": "Mythical",
+    "Pepper Seed": "Divine",
+    "Lemon Seed": "Divine",
+    "Passion Fruit Seed": "Divine",
+    "Dragon Fruit Seed": "Divine",
+    "Lychee Pit": "Divine",
+    "Sunflower Seed": "Divine",
+    "Starweaver Pod": "Celestial",
+}
 
 def set_rarity_threshold(name: str) -> bool:
     """Set the runtime rarity threshold. Returns True if accepted."""
@@ -144,6 +209,27 @@ async def cmd_set_threshold(ctx, rarity: str):
     else:
         await ctx.send(f"Unknown rarity '{rarity}'. Valid options: {', '.join(RARITY_PRIORITY.keys())}")
 
+@bot.command(name="set_plant_threshold")
+@commands.is_owner()
+async def cmd_set_plant_threshold(ctx, *, plant: str = None):
+    """Owner-only: set a plant name whose rarity will be used as the notification threshold.
+    Example: !set_plant_threshold "Mushroom Spore" -> use the rarity of Mushroom Spore as the threshold.
+    """
+    global PLANT_THRESHOLD_NAME
+    if not plant:
+        await ctx.send("Usage: !set_plant_threshold <plant name>\nExample: !set_plant_threshold Mushroom Spore")
+        return
+    PLANT_THRESHOLD_NAME = plant.strip()
+    await ctx.send(f"Plant threshold set to '{PLANT_THRESHOLD_NAME}'. The bot will use that plant's rarity as the filter when it can find the plant on a page.")
+
+@bot.command(name="clear_plant_threshold")
+@commands.is_owner()
+async def cmd_clear_plant_threshold(ctx):
+    """Owner-only: clear any plant-based threshold so the bot uses the rarity threshold instead."""
+    global PLANT_THRESHOLD_NAME
+    PLANT_THRESHOLD_NAME = None
+    await ctx.send("Cleared plant-based threshold; using rarity threshold again.")
+
 @bot.command(name="help")
 async def cmd_help(ctx):
     """Show available commands and basic usage."""
@@ -155,6 +241,11 @@ async def cmd_help(ctx):
         "!start_periodic_check [minutes] — Start periodic scans (default uses built-in interval)\n"
         "!stop_periodic_check — Stop the periodic scanner\n"
         "!run_seed_check — Run an immediate one-off scan"
+    )
+
+    owner_cmds += (
+        "\n!set_plant_threshold <plant name> — Use the specified plant's rarity as the threshold (owner only)\n"
+        "!clear_plant_threshold — Clear the plant-based threshold and use rarity threshold instead\n"
     )
 
     utility_cmds = (
@@ -174,7 +265,182 @@ async def cmd_help(ctx):
     embed.add_field(name="Utility commands", value=f"```\n{utility_cmds}\n```", inline=False)
     embed.add_field(name="Notes", value=notes, inline=False)
 
+    # The bot discovers plant names dynamically from the site. Use !list_plants to fetch
+    # the current item names from the open page (copy/paste a name into !set_plant_threshold).
+    embed.add_field(name="Plant names (dynamic)", value="Use `!list_plants` to fetch current plant/item names from the open page.", inline=False)
+
     await ctx.send(embed=embed)
+
+@bot.command(name="check_threshold")
+async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[str] = None, *, plant: Optional[str] = None):
+    """Show current threshold configuration. If attached to a page, optionally check a plant name on the page.
+
+    Usage:
+      !check_threshold                     -> show configured thresholds
+      !check_threshold 0                   -> show thresholds and inspect tab 0
+      !check_threshold 0 http://... "Plant Name"  -> inspect plant on tab 0 (plant name may contain spaces)
+    """
+    endpoint = endpoint or CDP_DEFAULT
+
+    lines = []
+    lines.append(f"Global rarity threshold: {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
+    if PLANT_THRESHOLD_NAME:
+        lines.append(f"Plant-based threshold configured: '{PLANT_THRESHOLD_NAME}'")
+    else:
+        lines.append("Plant-based threshold: not configured")
+
+    # If user only wanted configuration, and no page inspection requested, send short reply
+    if plant is None and index is None:
+        await ctx.send("\n".join(lines))
+        return
+
+    # Try to attach to a browser to inspect the page and plant if requested
+    attached = await _ensure_attached(endpoint)
+    if not attached:
+        await ctx.send("\n".join(lines) + f"\nNote: Failed to attach to CDP endpoint: {endpoint}")
+        return
+
+    pages = await _get_pages()
+    if not pages:
+        await ctx.send("\n".join(lines) + "\nNote: No open pages found in the attached browser.")
+        return
+
+    sel = 0 if index is None else int(index)
+    if sel < 0 or sel >= len(pages):
+        await ctx.send(f"Invalid index {sel}. Must be between 0 and {len(pages)-1}.")
+        return
+
+    page = pages[sel]
+    try:
+        # Scrape items with heuristic rarity from the page (same heuristics used elsewhere)
+        items = await page.evaluate(r"""
+            () => {
+                const out = [];
+                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
+                for (const card of cards) {
+                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
+                    const itemName = (nameEl && (nameEl.textContent || '').trim()) || '';
+                    if (!itemName) continue;
+                    const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
+                    let rarity = 'common';
+                    if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
+                    else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
+                    else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
+                    else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
+                    else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
+                    out.push({name: itemName, rarity});
+                }
+                // Deduplicate preserving first-seen order
+                const seen = new Set();
+                return out.filter(it => {
+                    if (seen.has(it.name)) return false;
+                    seen.add(it.name);
+                    return true;
+                });
+            }
+        """)
+
+        if not items:
+            await ctx.send("No item names were found on the page.")
+            return
+
+        # Build name->rarity map for quick lookup
+        heur = {it.get('name'): it.get('rarity') for it in items}
+
+        # If a specific plant name was requested, try to find it on the page
+        if plant:
+            pname = plant.strip().lower()
+            matched = None
+            for it in items:
+                iname = (it.get('name') or '').lower()
+                if iname == pname or pname in iname:
+                    matched = it
+                    break
+
+            if not matched:
+                lines.append(f"Plant '{plant}' not found on the selected page (tab {sel}).")
+                await ctx.send("\n".join(lines))
+                return
+
+            name = matched.get('name')
+            rarity = matched.get('rarity')
+            lines.append(f"Found plant on page: {name} — rarity: {rarity}")
+
+            # Canonical position info if available
+            if name in FULL_ORDER:
+                idx = FULL_ORDER.index(name)
+                lines.append(f"Position in canonical FULL_ORDER: {idx} (0 = lowest rarity -> higher index = rarer)")
+            else:
+                lines.append("Plant not present in canonical FULL_ORDER; position-based comparisons unavailable.")
+
+            # Determine whether this plant would meet the effective threshold
+            # Compute effective threshold according to current configuration and presence of PLANT_THRESHOLD_NAME
+            effective_threshold_value = RARITY_THRESHOLD_VALUE
+            threshold_source = f"rarity >= {RARITY_THRESHOLD_NAME}"
+            # If a plant-based threshold is configured, attempt to locate that plant on the same page
+            position_mode = False
+            plant_idx = None
+            plant_rarity = None
+            if PLANT_THRESHOLD_NAME:
+                pname_cfg = PLANT_THRESHOLD_NAME.strip().lower()
+                matched_cfg = None
+                for it in items:
+                    if (it.get('name') or '').lower() == pname_cfg or pname_cfg in (it.get('name') or '').lower():
+                        matched_cfg = it
+                        break
+                if matched_cfg:
+                    plant_name_cfg = matched_cfg.get('name')
+                    plant_rarity = matched_cfg.get('rarity', 'common')
+                    if plant_name_cfg in FULL_ORDER:
+                        position_mode = True
+                        plant_idx = FULL_ORDER.index(plant_name_cfg)
+                        threshold_source = f"plant position '{PLANT_THRESHOLD_NAME}' (index={plant_idx})"
+                    else:
+                        effective_threshold_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
+                        threshold_source = f"plant '{PLANT_THRESHOLD_NAME}' (rarity={plant_rarity})"
+                else:
+                    # configured plant not found; fallback to global rarity threshold
+                    threshold_source = f"rarity >= {RARITY_THRESHOLD_NAME} (plant threshold '{PLANT_THRESHOLD_NAME}' not found on page)"
+
+            # Decide if the inspected plant meets the effective threshold
+            meets = False
+            if position_mode and plant_idx is not None:
+                if name in FULL_ORDER:
+                    meets = FULL_ORDER.index(name) >= plant_idx
+                else:
+                    # unknown items: fallback to rarity comparison against the plant's rarity
+                    compare_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
+                    meets = RARITY_PRIORITY.get(rarity, 0) >= compare_value
+            else:
+                meets = RARITY_PRIORITY.get(rarity, 0) >= effective_threshold_value
+
+            lines.append(f"Effective threshold used for comparison: {threshold_source}")
+            lines.append(f"Does '{name}' meet the effective threshold? {'YES' if meets else 'NO'}")
+            await ctx.send("\n".join(lines))
+            return
+
+        # If no specific plant requested but plant threshold is configured, try to show what plant is being used as threshold
+        if PLANT_THRESHOLD_NAME:
+            pname_cfg = PLANT_THRESHOLD_NAME.strip().lower()
+            matched_cfg = None
+            for it in items:
+                if (it.get('name') or '').lower() == pname_cfg or pname_cfg in (it.get('name') or '').lower():
+                    matched_cfg = it
+                    break
+            if matched_cfg:
+                p_name = matched_cfg.get('name')
+                p_rarity = matched_cfg.get('rarity')
+                lines.append(f"Configured plant threshold '{PLANT_THRESHOLD_NAME}' found on page as '{p_name}' with rarity {p_rarity}.")
+                if p_name in FULL_ORDER:
+                    lines.append(f"Using position-based threshold: items at or after index {FULL_ORDER.index(p_name)} in FULL_ORDER will qualify.")
+                else:
+                    lines.append(f"Plant not in canonical FULL_ORDER; falling back to rarity-based threshold using rarity '{p_rarity}'.")
+            else:
+                lines.append(f"Configured plant threshold '{PLANT_THRESHOLD_NAME}' was not found on the current page (tab {sel}).")
+
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        await ctx.send(f"Error while inspecting page: {e}")
 
 async def _notify_all_guilds(message: str):
     """Send message to the first writable text channel in each guild. Returns number of guilds messaged."""
@@ -251,7 +517,7 @@ async def _parse_page_for_restock_and_alert(page):
             _last_restock_notified[page.url] = True
             return False
 
-        # Filter for mythic-or-above by priority
+        # Filter for mythic-and-above by priority
         mythic_and_above = [it for it in items if RARITY_PRIORITY.get(it.get('rarity','common'),0) >= RARITY_THRESHOLD_VALUE]
         if not mythic_and_above:
             _last_restock_notified[page.url] = True
@@ -420,9 +686,58 @@ async def _scan_and_notify_threshold(page):
             if it.get('count') is not None or re.search(r"X\s*\d+", stock_text or '', re.I):
                 in_stock.append(it)
 
-        # Now apply the configured rarity threshold to the in-stock list
-        in_stock_filtered = [it for it in in_stock if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= RARITY_THRESHOLD_VALUE]
-        print(f"_scan_and_notify_threshold: found {len(items)} total items, {len(in_stock)} in-stock, {len(in_stock_filtered)} in-stock meeting threshold {RARITY_THRESHOLD_NAME}")
+        # Determine effective threshold: either plant-based (if configured and found on page)
+        # or the global rarity threshold. Use the plant's rarity value when available.
+        effective_threshold_value = RARITY_THRESHOLD_VALUE
+        threshold_source = f"rarity >= {RARITY_THRESHOLD_NAME}"
+        # Position-mode allows using the canonical FULL_ORDER to include the given plant and
+        # everything rarer than it according to the authoritative ordering. If the plant
+        # is not present in FULL_ORDER we fall back to rarity-based filtering (original behavior).
+        position_mode = False
+        plant_idx = None
+        plant_rarity = None
+        if PLANT_THRESHOLD_NAME:
+            pname = PLANT_THRESHOLD_NAME.strip().lower()
+            matched = None
+            for it in items:
+                iname = (it.get('name') or '').lower()
+                if iname == pname or pname in iname:
+                    matched = it
+                    break
+            if matched:
+                plant_name = matched.get('name')
+                plant_rarity = matched.get('rarity', 'common')
+                if plant_name in FULL_ORDER:
+                    position_mode = True
+                    plant_idx = FULL_ORDER.index(plant_name)
+                    threshold_source = f"plant position '{PLANT_THRESHOLD_NAME}' (index={plant_idx})"
+                    print(f"_scan_and_notify_threshold: plant threshold '{PLANT_THRESHOLD_NAME}' matched canonical ordering at index {plant_idx}; using position-based filtering")
+                else:
+                    effective_threshold_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
+                    threshold_source = f"plant '{PLANT_THRESHOLD_NAME}' (rarity={plant_rarity})"
+                    print(f"_scan_and_notify_threshold: plant threshold '{PLANT_THRESHOLD_NAME}' found with rarity {plant_rarity}; using rarity-based filtering as fallback")
+            else:
+                print(f"_scan_and_notify_threshold: plant threshold '{PLANT_THRESHOLD_NAME}' not found on page; falling back to rarity threshold {RARITY_THRESHOLD_NAME}")
+
+        # Apply filtering either by canonical position (if enabled) or by rarity value.
+        if position_mode and plant_idx is not None:
+            in_stock_filtered = []
+            for it in in_stock:
+                name = it.get('name')
+                if name in FULL_ORDER:
+                    # Include items whose index is >= the plant's index (plant and anything rarer)
+                    if FULL_ORDER.index(name) >= plant_idx:
+                        in_stock_filtered.append(it)
+                else:
+                    # Unknown items: fall back to rarity comparison against the plant's rarity if known,
+                    # otherwise fall back to the configured rarity threshold.
+                    compare_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
+                    if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= compare_value:
+                        in_stock_filtered.append(it)
+        else:
+            in_stock_filtered = [it for it in in_stock if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= effective_threshold_value]
+
+        print(f"_scan_and_notify_threshold: found {len(items)} total items, {len(in_stock)} in-stock, {len(in_stock_filtered)} in-stock meeting threshold ({threshold_source})")
 
         # If no in-stock items meet the threshold, clear stored state and skip
         if not in_stock_filtered:
@@ -443,7 +758,7 @@ async def _scan_and_notify_threshold(page):
             print(f"_scan_and_notify_threshold: NOTIFY_ON_NEW_ONLY=False, will notify every scan if items present")
 
         # Build message: include only the filtered in-stock section (threshold-passing items)
-        lines = [f"@everyone MAGIC GARDEN ALERT: Items found with rarity >= {RARITY_THRESHOLD_NAME}):"]
+        lines = [f"@everyone MAGIC GARDEN ALERT: Items found matching threshold ({threshold_source}):"]
         for it in in_stock_filtered:
             count = it.get('count')
             stock = it.get('stockText') or ''
@@ -507,18 +822,29 @@ async def _periodic_seed_check(interval_seconds: int = PERIODIC_INTERVAL_SECONDS
                 print(f"_periodic_seed_check: scanning page {getattr(page,'url', 'unknown')}")
                 # Reuse existing parsing/alert functions
                 try:
-                    await _parse_page_for_restock_and_alert(page)
+                    # If the restock path sends notifications it returns True; capture that so
+                    # we don't run the threshold scanner in the same iteration and duplicate messages.
+                    restock_sent = False
+                    try:
+                        restock_sent = await _parse_page_for_restock_and_alert(page)
+                    except Exception as e:
+                        print(f"_periodic_seed_check: restock parse error for {getattr(page,'url','unknown')}: {e}")
+
+                    try:
+                        await _check_timer_and_alert(page)
+                    except Exception as e:
+                        print(f"_periodic_seed_check: timer check error for {getattr(page,'url','unknown')}: {e}")
+
+                    if restock_sent:
+                        print(f"_periodic_seed_check: restock handler already sent notification for {getattr(page,'url','unknown')}, skipping threshold scan")
+                    else:
+                        # New: scan for items meeting rarity threshold and notify automatically
+                        try:
+                            await _scan_and_notify_threshold(page)
+                        except Exception as e:
+                            print(f"_periodic_seed_check: threshold scan error for {getattr(page,'url','unknown')}: {e}")
                 except Exception as e:
-                    print(f"_periodic_seed_check: restock parse error for {getattr(page,'url','unknown')}: {e}")
-                try:
-                    await _check_timer_and_alert(page)
-                except Exception as e:
-                    print(f"_periodic_seed_check: timer check error for {getattr(page,'url','unknown')}: {e}")
-                # New: scan for items meeting rarity threshold and notify automatically
-                try:
-                    await _scan_and_notify_threshold(page)
-                except Exception as e:
-                    print(f"_periodic_seed_check: threshold scan error for {getattr(page,'url','unknown')}: {e}")
+                    print(f"_periodic_seed_check: per-page top-level error for {getattr(page,'url','unknown')}: {e}")
         except Exception as e:
             print(f"_periodic_seed_check: top-level error: {e}")
         await asyncio.sleep(interval_seconds)
@@ -745,6 +1071,165 @@ async def in_stock(ctx, index: Optional[int] = None, endpoint: Optional[str] = N
             await ctx.send(file=discord.File(io.BytesIO(msg.encode('utf-8')), filename='in_stock.txt'))
     except Exception as e:
         await ctx.send(f"Error during in_stock parse: {e}")
+
+@bot.command(name="list_plants")
+async def list_plants(ctx, index: Optional[int] = None, endpoint: Optional[str] = None):
+    """List all item names currently scraped from the page.
+
+    Usage:
+      !list_plants                -> list names from first open tab
+      !list_plants 1              -> list names from tab index 1
+      !list_plants 0 http://...   -> specify CDP endpoint
+    """
+    endpoint = endpoint or CDP_DEFAULT
+    attached = await _ensure_attached(endpoint)
+    if not attached:
+        await ctx.send(f"Failed to attach to CDP endpoint: {endpoint}")
+        return
+
+    pages = await _get_pages()
+    if not pages:
+        await ctx.send("No open pages found in the attached browser.")
+        return
+
+    sel = 0 if index is None else int(index)
+    if sel < 0 or sel >= len(pages):
+        await ctx.send(f"Invalid index {sel}. Must be between 0 and {len(pages)-1}.")
+        return
+
+    page = pages[sel]
+    try:
+        # Scrape name + heuristic rarity from the page, then sort using a supplied
+        # authoritative ordering and rarity map (falling back to the heuristic when
+        # an item is not in the map).
+        items = await page.evaluate(r"""
+            () => {
+                const out = [];
+                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
+                for (const card of cards) {
+                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
+                    const itemName = (nameEl && (nameEl.textContent || '').trim()) || '';
+                    if (!itemName) continue;
+                    const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
+                    let rarity = 'common';
+                    if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
+                    else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
+                    else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
+                    else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
+                    else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
+                    out.push({name: itemName, rarity});
+                }
+                // Deduplicate by name while preserving first-seen order
+                const seen = new Set();
+                return out.filter(it => {
+                    if (seen.has(it.name)) return false;
+                    seen.add(it.name);
+                    return true;
+                });
+            }
+        """)
+
+        # Filter out spurious names that are just numeric badges (e.g. "1") or empty strings
+        items = [it for it in items if (it.get('name') or '').strip() and not re.match(r'^\d+$', (it.get('name') or '').strip())]
+
+        if not items:
+            await ctx.send("No item names were found on the page.")
+            return
+
+        # Authoritative ordering & rarities provided by the user. Items present in this
+        # list will be shown in this exact order and with the mapped rarity label.
+        FULL_ORDER = [
+            "Carrot Seed",
+            "Strawberry Seed",
+            "Aloe Seed",
+            "Blueberry Seed",
+            "Apple Seed",
+            "Tulip Seed",
+            "Tomato Seed",
+            "Daffodil Seed",
+            "Corn Kernel",
+            "Watermelon Seed",
+            "Pumpkin Seed",
+            "Echeveria Cutting",
+            "Coconut Seed",
+            "Banana Seed",
+            "Lily Seed",
+            "Burro's Tail Cutting",
+            "Mushroom Spore",
+            "Cactus Seed",
+            "Bamboo Seed",
+            "Grape Seed",
+            "Pepper Seed",
+            "Lemon Seed",
+            "Passion Fruit Seed",
+            "Dragon Fruit Seed",
+            "Lychee Pit",
+            "Sunflower Seed",
+            "Starweaver Pod",
+        ]
+
+        RARITY_MAP = {
+            "Carrot Seed": "Common",
+            "Strawberry Seed": "Common",
+            "Aloe Seed": "Common",
+            "Blueberry Seed": "Uncommon",
+            "Apple Seed": "Uncommon",
+            "Tulip Seed": "Uncommon",
+            "Tomato Seed": "Uncommon",
+            "Daffodil Seed": "Rare",
+            "Corn Kernel": "Rare",
+            "Watermelon Seed": "Rare",
+            "Pumpkin Seed": "Rare",
+            "Echeveria Cutting": "Legendary",
+            "Coconut Seed": "Legendary",
+            "Banana Seed": "Legendary",
+            "Lily Seed": "Legendary",
+            "Burro's Tail Cutting": "Legendary",
+            "Mushroom Spore": "Mythical",
+            "Cactus Seed": "Mythical",
+            "Bamboo Seed": "Mythical",
+            "Grape Seed": "Mythical",
+            "Pepper Seed": "Divine",
+            "Lemon Seed": "Divine",
+            "Passion Fruit Seed": "Divine",
+            "Dragon Fruit Seed": "Divine",
+            "Lychee Pit": "Divine",
+            "Sunflower Seed": "Divine",
+            "Starweaver Pod": "Celestial",
+        }
+
+        # Build a name->heuristic_rarity map from the scraped items for fallback
+        heur = {it.get('name'): it.get('rarity') for it in items}
+
+        def sort_key(it):
+            name = it.get('name')
+            if name in FULL_ORDER:
+                return (0, FULL_ORDER.index(name))
+            # unknown items go after known ones, sorted alphabetically
+            return (1, name.lower())
+
+        items_sorted = sorted(items, key=sort_key)
+
+        lines = []
+        for it in items_sorted:
+            name = it.get('name')
+            label = RARITY_MAP.get(name)
+            if not label:
+                # fallback: use scraped heuristic rarity and title-case it
+                label = (heur.get(name) or 'common').capitalize()
+            lines.append(f"{name} — {label}")
+
+        text = "\n".join(lines)
+
+        # We no longer save/export to plants.json; the list is generated live from the page.
+
+        # Send the list; use a file if too long
+        if len(text) <= 1900:
+            await ctx.send("```\n" + text + "\n```")
+        else:
+            await ctx.send(file=discord.File(io.BytesIO(text.encode('utf-8')), filename='plants.txt'))
+    except Exception as e:
+        await ctx.send(f"Error while scraping names: {e}")
 
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN in .env")

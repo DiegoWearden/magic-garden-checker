@@ -32,7 +32,12 @@ Run a Chromium instance for CDP (example using Chrome/Chromium):
 
 - Google Chrome / Chromium:
 
-  google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-cdp &
+  chromium-browser --headless=new \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port=9222 \
+    --user-data-dir=/home/diego/chrome-profile \
+    --disable-gpu --no-first-run --no-default-browser-check \
+    https://magiccircle.gg/r/LDQK
 
 This makes a CDP endpoint available at http://127.0.0.1:9222 (the default the bot uses).
 
