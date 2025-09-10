@@ -257,20 +257,15 @@ async def _parse_page_for_restock_and_alert(page):
             _last_restock_notified[page.url] = True
             return False
 
-        # Build message
-        lines = [f"Restock detected on {page.url} - Mythic+ items:"]
-        for it in mythic_and_above:
-            count = it.get('count')
-            stock = it.get('stockText') or ''
-            if count is not None:
-                lines.append(f"- {it.get('name')} — {stock} ({count} units) — {it.get('rarity')}")
-            else:
-                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
-        msg = '\n'.join(lines)
-
-        await _notify_all_guilds(msg)
+        # Instead of sending a separate restock-specific message, defer to the unified
+        # threshold scanner which will send notifications according to the configured threshold.
+        try:
+            sent = await _scan_and_notify_threshold(page)
+        except Exception:
+            sent = False
+        # Mark that we've processed this restock banner so we don't repeatedly handle it
         _last_restock_notified[page.url] = True
-        return True
+        return bool(sent)
     except Exception:
         return False
 
