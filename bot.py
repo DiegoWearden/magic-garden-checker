@@ -105,6 +105,8 @@ RARITY_PRIORITY = {
     'epic': 3,
     'legendary': 4,
     'mythic': 5,
+    'divine': 6,
+    'celestial': 7,
 }
 
 # Rarity threshold configuration
@@ -203,7 +205,7 @@ def set_rarity_threshold(name: str) -> bool:
 @bot.command(name="set_threshold")
 @commands.is_owner()
 async def cmd_set_threshold(ctx, rarity: str):
-    """Bot owner only: set the restock rarity threshold (e.g. common, rare, mythic)."""
+    """Bot owner only: set the restock rarity threshold (e.g. common, rare, mythic, divine, celestial)."""
     if set_rarity_threshold(rarity):
         await ctx.send(f"Rarity threshold set to {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
     else:
@@ -238,7 +240,7 @@ async def cmd_help(ctx):
 
     # Build nicer-formatted command lists using inline code for commands and short descriptions
     owner_cmds_lines = [
-        "`!set_threshold <rarity>` — Set notification threshold (common, uncommon, rare, epic, legendary, mythic)",
+        "`!set_threshold <rarity>` — Set notification threshold (common, uncommon, rare, epic, legendary, mythic, divine, celestial)",
         "`!start_periodic_check [minutes]` — Start periodic scans (default uses built-in interval)",
         "`!stop_periodic_check` — Stop the periodic scanner",
         "`!run_seed_check` — Run an immediate one-off scan",
@@ -324,7 +326,9 @@ async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[s
                     if (!itemName) continue;
                     const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
                     let rarity = 'common';
-                    if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
+                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
+                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
+                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
                     else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
                     else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
                     else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
@@ -498,15 +502,16 @@ async def _parse_page_for_restock_and_alert(page):
                     const m = stockText.match(/X\s*(\d+)/i);
                     const count = m ? parseInt(m[1], 10) : null;
 
-                    // rarity heuristics: look for words like Mythic/Legendary/Epic/Rare near the card
+                    // rarity heuristics: look for words like Celestial/Divine/Mythic/Legendary/Epic/Rare near the card
                     const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
-                    let rarity = '';
-                    if (/mythic/i.test(rarityCandidate)) rarity = 'mythic';
+                    let rarity = 'common';
+                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
+                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
+                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
                     else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
                     else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
                     else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
                     else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
-                    else rarity = 'common';
 
                     out.push({name: itemName, stockText, count, rarity});
                 }
@@ -590,7 +595,9 @@ async def _check_timer_and_alert(page):
 
                     const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
                     let rarity = '';
-                    if (/mythic/i.test(rarityCandidate)) rarity = 'mythic';
+                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
+                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
+                    else if (/mythic/i.test(rarityCandidate)) rarity = 'mythic';
                     else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
                     else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
                     else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
@@ -657,7 +664,9 @@ async def _scan_and_notify_threshold(page):
 
                     const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
                     let rarity = '';
-                    if (/mythic/i.test(rarityCandidate)) rarity = 'mythic';
+                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
+                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
+                    else if (/mythic/i.test(rarityCandidate)) rarity = 'mythic';
                     else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
                     else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
                     else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
@@ -1113,7 +1122,9 @@ async def list_plants(ctx, index: Optional[int] = None, endpoint: Optional[str] 
                     if (!itemName) continue;
                     const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
                     let rarity = 'common';
-                    if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
+                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
+                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
+                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
                     else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
                     else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
                     else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
