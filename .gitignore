@@ -134,4 +134,13 @@ dmypy.json
 .pytype/
 
 # Cython debug symbols
-cython_debug/ 
+cython_debug/
+
+# Playwright browser cache and runtime files
+.playwright-cache/
+.playwright/
+.cache/ms-playwright/
+
+# Editor and OS files
+.vscode/
+.DS_Store
