@@ -1,6 +1,8 @@
 discord.py
 python-dotenv
+playwright
 dateparser
 tzdata
 python-dateutil
-spacy 
+spacy
+requests
