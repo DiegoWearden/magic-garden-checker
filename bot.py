@@ -1,12 +1,13 @@
 import os
 import io
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 import asyncio
 import re
 import argparse
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import json
 
 # If you installed Playwright browsers in a local cache, prefer that before importing Playwright
 os.environ.setdefault(
@@ -57,6 +58,47 @@ if PERIODIC_START_STR:
 # Remove RESTOCK_TRIGGER_TIME env usage; disable the exact timer-trigger unless set elsewhere
 TRIGGER_MIN = None
 TRIGGER_SEC = None
+
+# Path for persistent per-guild settings
+GUILD_SETTINGS_PATH = Path(__file__).resolve().parent / "guild_settings.json"
+# In-memory cache of guild settings loaded from disk
+GUILD_SETTINGS: Dict[str, Dict[str, Any]] = {}
+
+def _load_guild_settings() -> None:
+    """Load guild settings from JSON on startup (silently ignore missing/invalid file)."""
+    global GUILD_SETTINGS
+    try:
+        if GUILD_SETTINGS_PATH.exists():
+            with open(GUILD_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                GUILD_SETTINGS = json.load(f)
+                # ensure string keys
+                GUILD_SETTINGS = {str(k): dict(v or {}) for k, v in GUILD_SETTINGS.items()}
+        else:
+            GUILD_SETTINGS = {}
+    except Exception:
+        GUILD_SETTINGS = {}
+
+def _save_guild_settings() -> None:
+    """Persist current guild settings to disk (best-effort)."""
+    try:
+        with open(GUILD_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(GUILD_SETTINGS, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+def _get_guild_config_for(guild_id: int) -> Dict[str, Any]:
+    """Return the effective per-guild config dict with defaults applied."""
+    g = GUILD_SETTINGS.get(str(guild_id), {})
+    return {
+        # Do NOT fall back to the old global RARITY_THRESHOLD_NAME here — prefer per-guild config.
+        'rarity': g.get('rarity', None),
+        'plant': g.get('plant', None),
+        'notify_on_new_only': g.get('notify_on_new_only', NOTIFY_ON_NEW_ONLY),
+        'channel_id': g.get('channel_id', None),
+    }
+
+# Load settings at module import
+_load_guild_settings()
 
 # Minimal bot that attaches to an external headless Chromium and returns the current page HTML
 class SimpleCDPBot(commands.Bot):
@@ -202,14 +244,105 @@ def set_rarity_threshold(name: str) -> bool:
         return True
     return False
 
-@bot.command(name="set_threshold")
-@commands.is_owner()
-async def cmd_set_threshold(ctx, rarity: str):
-    """Bot owner only: set the restock rarity threshold (e.g. common, rare, mythic, divine, celestial)."""
-    if set_rarity_threshold(rarity):
-        await ctx.send(f"Rarity threshold set to {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
-    else:
+@bot.command(name="set_server_threshold")
+@commands.has_permissions(administrator=True)
+async def cmd_set_server_threshold(ctx, rarity: str):
+    """Server administrators: set this server's rarity threshold. Example: !set_server_threshold divine"""
+    if not ctx.guild:
+        await ctx.send("This command must be used inside a server/guild channel.")
+        return
+    n = (rarity or "").lower()
+    if n not in RARITY_PRIORITY:
         await ctx.send(f"Unknown rarity '{rarity}'. Valid options: {', '.join(RARITY_PRIORITY.keys())}")
+        return
+    gid = str(ctx.guild.id)
+    cfg = GUILD_SETTINGS.get(gid, {})
+    cfg['rarity'] = n
+    GUILD_SETTINGS[gid] = cfg
+    _save_guild_settings()
+    await ctx.send(f"This server's rarity threshold set to {n}.")
+
+@bot.command(name="set_server_plant")
+@commands.has_permissions(administrator=True)
+async def cmd_set_server_plant(ctx, *, plant: str = None):
+    """Server administrators: set a plant name to use as this server's threshold. Example: !set_server_plant "Mushroom Spore""" 
+    if not ctx.guild:
+        await ctx.send("This command must be used inside a server/guild channel.")
+        return
+    if not plant:
+        await ctx.send("Usage: !set_server_plant <plant name>\nExample: !set_server_plant Mushroom Spore")
+        return
+    gid = str(ctx.guild.id)
+    cfg = GUILD_SETTINGS.get(gid, {})
+    cfg['plant'] = plant.strip()
+    GUILD_SETTINGS[gid] = cfg
+    _save_guild_settings()
+    await ctx.send(f"This server's plant-based threshold set to '{plant.strip()}'.")
+
+@bot.command(name="clear_server_plant")
+@commands.has_permissions(administrator=True)
+async def cmd_clear_server_plant(ctx):
+    """Server administrators: clear this server's plant-based threshold so the server uses the rarity threshold instead."""
+    if not ctx.guild:
+        await ctx.send("This command must be used inside a server/guild channel.")
+        return
+    gid = str(ctx.guild.id)
+    cfg = GUILD_SETTINGS.get(gid, {})
+    cfg.pop('plant', None)
+    GUILD_SETTINGS[gid] = cfg
+    _save_guild_settings()
+    await ctx.send("Cleared this server's plant-based threshold; using rarity threshold again.")
+
+@bot.command(name="set_server_notify_new_only")
+@commands.has_permissions(administrator=True)
+async def cmd_set_server_notify_new_only(ctx, flag: str = 'true'):
+    """Server administrators: toggle whether this server only receives notifications for new items (true/false)."""
+    if not ctx.guild:
+        await ctx.send("This command must be used inside a server/guild channel.")
+        return
+    val = flag.strip().lower() in ('1','true','yes','y')
+    gid = str(ctx.guild.id)
+    cfg = GUILD_SETTINGS.get(gid, {})
+    cfg['notify_on_new_only'] = val
+    GUILD_SETTINGS[gid] = cfg
+    _save_guild_settings()
+    await ctx.send(f"This server's notify_on_new_only set to {val}.")
+
+@bot.command(name="set_server_channel")
+@commands.has_permissions(administrator=True)
+async def cmd_set_server_channel(ctx, channel_id: Optional[int] = None):
+    """Server administrators: set a channel ID where notifications will be sent for this server. If omitted, the bot falls back to the first writable text channel."""
+    if not ctx.guild:
+        await ctx.send("This command must be used inside a server/guild channel.")
+        return
+    gid = str(ctx.guild.id)
+    cfg = GUILD_SETTINGS.get(gid, {})
+    if channel_id is None:
+        cfg.pop('channel_id', None)
+        GUILD_SETTINGS[gid] = cfg
+        _save_guild_settings()
+        await ctx.send("Cleared configured channel; the bot will use the first writable text channel instead.")
+        return
+    cfg['channel_id'] = int(channel_id)
+    GUILD_SETTINGS[gid] = cfg
+    _save_guild_settings()
+    await ctx.send(f"This server's notification channel set to {channel_id}.")
+
+@bot.command(name="show_server_settings")
+@commands.has_permissions(administrator=True)
+async def cmd_show_server_settings(ctx):
+    """Show the current server-specific configuration (if any)."""
+    if not ctx.guild:
+        await ctx.send("This command must be used inside a server/guild channel.")
+        return
+    cfg = _get_guild_config_for(ctx.guild.id)
+    lines = [f"Server settings for {ctx.guild.name} (id {ctx.guild.id}):"]
+    rarity_val = cfg.get('rarity') if cfg.get('rarity') is not None else 'not configured'
+    lines.append(f"- rarity: {rarity_val}")
+    lines.append(f"- plant: {cfg.get('plant')}")
+    lines.append(f"- notify_on_new_only: {cfg.get('notify_on_new_only')}")
+    lines.append(f"- channel_id: {cfg.get('channel_id')}")
+    await ctx.send("\n".join(lines))
 
 @bot.command(name="set_plant_threshold")
 @commands.is_owner()
@@ -235,42 +368,56 @@ async def cmd_clear_plant_threshold(ctx):
 @bot.command(name="help")
 async def cmd_help(ctx):
     """Show available commands and basic usage."""
-    embed = discord.Embed(title="Magic Garden Checker — Commands", color=0x2ecc71)
-    embed.description = "Use these commands to inspect the shop page, control the periodic checker, and change the rarity threshold. Owner-only commands require the bot owner."
+    embed = discord.Embed(title="Magic Garden Checker — Commands", color=0x3498db)
+    embed.description = (
+        "Quick reference for available commands. Commands marked (owner) require the bot owner; server-admin commands require Administrator permissions."
+    )
 
-    # Build nicer-formatted command lists using inline code for commands and short descriptions
+    quick_start = (
+        "• The bot connects to an external Chromium instance over CDP (CDP_DEFAULT).\n"
+        "• Start the browser and open the shop page(s) you want the bot to inspect.\n"
+        "• Use `!set_server_channel <channel_id>` to pin notifications to a specific channel (recommended).\n"
+        "• Optionally schedule automatic periodic checks with `--periodic-start HH:MM[:SS]` when launching the bot."
+    )
+
     owner_cmds_lines = [
-        "`!set_threshold <rarity>` — Set notification threshold (common, uncommon, rare, epic, legendary, mythic, divine, celestial)",
-        "`!start_periodic_check [minutes]` — Start periodic scans (default uses built-in interval)",
-        "`!stop_periodic_check` — Stop the periodic scanner",
-        "`!run_seed_check` — Run an immediate one-off scan",
-        "`!set_plant_threshold <plant name>` — Use the specified plant's rarity as the threshold (owner only)",
-        "`!clear_plant_threshold` — Clear the plant-based threshold and use rarity threshold instead",
+        "`!start_periodic_check [minutes]` — Start periodic scans (owner only).",
+        "`!stop_periodic_check` — Stop the periodic scanner (owner only).",
+        "`!run_seed_check` — Run an immediate one-off scan (owner only).",
+        "`!set_plant_threshold <plant name>` — Use the specified plant's rarity as the global threshold (owner only).",
+        "`!clear_plant_threshold` — Clear the global plant-based threshold (owner only).",
+    ]
+
+    admin_cmds_lines = [
+        "`!set_server_threshold <rarity>` — Set this server's rarity threshold (administrator).",
+        "`!set_server_plant <plant name>` — Use a specific plant on pages as this server's threshold (administrator).",
+        "`!clear_server_plant` — Clear the server's plant-based threshold (administrator).",
+        "`!set_server_notify_new_only <true|false>` — Send notifications only for newly seen items (administrator).",
+        "`!set_server_channel <channel_id>` — Configure which channel this server receives notifications in (administrator).",
+        "`!show_server_settings` — Display this server's current configuration (administrator).",
     ]
 
     utility_cmds_lines = [
-        "`!check_threshold [index] [endpoint] [\"Plant Name\"]` — Show current threshold configuration and optionally inspect a plant on a page",
-        "`!current_html [index] [endpoint]` — Return page HTML for debugging",
-        "`!screenshot [index] [full] [endpoint]` — Capture a screenshot (use 'true' for full)",
-        "`!in_stock [index] [endpoint]` — List items detected as in-stock",
-        "`!list_plants` — Fetch current plant/item names from the open page",
+        "`!check_threshold [index] [endpoint] [\"Plant Name\"]` — Show configured thresholds and optionally inspect a plant on a tab.",
+        "`!current_html [index] [endpoint]` — Return page HTML for debugging.",
+        "`!screenshot [index] [full] [endpoint]` — Capture a screenshot; use `true` for full-page.",
+        "`!in_stock [index] [endpoint]` — List items detected as in-stock on the selected tab.",
+        "`!list_plants` — Fetch current plant/item names from the open page (useful for `!set_plant_threshold`).",
+        "`!help` — Show this help message.",
     ]
 
-    notes = (
-        "• The bot attaches to an external Chromium via CDP (CDP_DEFAULT).\n"
-        "• Schedule periodic start with --periodic-start (interpreted as America/Chicago).\n"
-        "• Use !set_threshold to change the runtime threshold.\n"
-        "• Owner commands require the bot owner to run them."
-    )
-
-    # Show owner and utility commands as separate embed fields with nicer formatting
+    embed.add_field(name="Quick start", value=quick_start, inline=False)
     embed.add_field(name="Owner-only commands", value="\n".join(owner_cmds_lines), inline=False)
+    embed.add_field(name="Server administrator commands", value="\n".join(admin_cmds_lines), inline=False)
     embed.add_field(name="Utility commands", value="\n".join(utility_cmds_lines), inline=False)
-    embed.add_field(name="Notes", value=notes, inline=False)
 
-    # The bot discovers plant names dynamically from the site. Use !list_plants to fetch
-    # the current item names from the open page (copy/paste a name into !set_plant_threshold).
-    embed.add_field(name="Plant names (dynamic)", value="Use `!list_plants` to fetch current plant/item names from the open page.", inline=False)
+    notes = (
+        "Notes:\n"
+        "• If a server has neither a rarity nor plant threshold configured, it will not receive automatic notifications.\n"
+        "• Plant thresholds are matched against names discovered on the page; use `!list_plants` to obtain exact names.\n"
+        "• The bot attaches to an external browser — ensure the browser is running and accessible at the CDP endpoint."
+    )
+    embed.add_field(name="Notes", value=notes, inline=False)
 
     await ctx.send(embed=embed)
 
@@ -285,17 +432,49 @@ async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[s
     """
     endpoint = endpoint or CDP_DEFAULT
 
+    # Prefer per-guild settings when invoked from inside a guild; otherwise show global defaults.
+    guild_cfg = None
+    if ctx.guild:
+        guild_cfg = _get_guild_config_for(ctx.guild.id)
+
     lines = []
-    lines.append(f"Global rarity threshold: {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
-    if PLANT_THRESHOLD_NAME:
-        lines.append(f"Plant-based threshold configured: '{PLANT_THRESHOLD_NAME}'")
+    if guild_cfg:
+        # show whether this server has a configured rarity threshold
+        if guild_cfg.get('rarity') is not None:
+            lines.append(f"Server rarity threshold: {guild_cfg.get('rarity')} ({RARITY_PRIORITY.get(guild_cfg.get('rarity'), RARITY_THRESHOLD_VALUE)})")
+        else:
+            lines.append("Server rarity threshold: not configured")
+        if guild_cfg.get('plant'):
+            lines.append(f"Server plant-based threshold configured: '{guild_cfg.get('plant')}'")
+        else:
+            lines.append("Server plant-based threshold: not configured")
+        lines.append(f"Server notify_on_new_only: {guild_cfg.get('notify_on_new_only')}")
+        if guild_cfg.get('channel_id'):
+            lines.append(f"Server configured channel_id: {guild_cfg.get('channel_id')}")
     else:
-        lines.append("Plant-based threshold: not configured")
+        lines.append(f"Global rarity threshold: {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
+        if PLANT_THRESHOLD_NAME:
+            lines.append(f"Global plant-based threshold configured: '{PLANT_THRESHOLD_NAME}'")
+        else:
+            lines.append("Global plant-based threshold: not configured")
+        lines.append(f"Global notify_on_new_only: {NOTIFY_ON_NEW_ONLY}")
 
     # If user only wanted configuration, and no page inspection requested, send short reply
     if plant is None and index is None:
         await ctx.send("\n".join(lines))
         return
+
+    # When inspecting a page, use guild-specific plant if present, otherwise the global PLANT_THRESHOLD_NAME
+    effective_plant_threshold = None
+    if guild_cfg and guild_cfg.get('plant'):
+        effective_plant_threshold = guild_cfg.get('plant')
+    else:
+        effective_plant_threshold = PLANT_THRESHOLD_NAME
+
+    # Use guild-specific rarity threshold value for comparisons when invoked from a guild
+    effective_global_threshold_value = RARITY_THRESHOLD_VALUE
+    if guild_cfg:
+        effective_global_threshold_value = RARITY_PRIORITY.get(guild_cfg.get('rarity', RARITY_THRESHOLD_NAME), RARITY_THRESHOLD_VALUE)
 
     # Try to attach to a browser to inspect the page and plant if requested
     attached = await _ensure_attached(endpoint)
@@ -379,15 +558,15 @@ async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[s
                 lines.append("Plant not present in canonical FULL_ORDER; position-based comparisons unavailable.")
 
             # Determine whether this plant would meet the effective threshold
-            # Compute effective threshold according to current configuration and presence of PLANT_THRESHOLD_NAME
-            effective_threshold_value = RARITY_THRESHOLD_VALUE
-            threshold_source = f"rarity >= {RARITY_THRESHOLD_NAME}"
+            # Compute effective threshold according to current configuration and presence of a plant-based threshold
+            effective_threshold_value = effective_global_threshold_value
+            threshold_source = f"rarity >= {guild_cfg.get('rarity') if guild_cfg else RARITY_THRESHOLD_NAME}"
             # If a plant-based threshold is configured, attempt to locate that plant on the same page
             position_mode = False
             plant_idx = None
             plant_rarity = None
-            if PLANT_THRESHOLD_NAME:
-                pname_cfg = PLANT_THRESHOLD_NAME.strip().lower()
+            if effective_plant_threshold:
+                pname_cfg = effective_plant_threshold.strip().lower()
                 matched_cfg = None
                 for it in items:
                     if (it.get('name') or '').lower() == pname_cfg or pname_cfg in (it.get('name') or '').lower():
@@ -399,13 +578,12 @@ async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[s
                     if plant_name_cfg in FULL_ORDER:
                         position_mode = True
                         plant_idx = FULL_ORDER.index(plant_name_cfg)
-                        threshold_source = f"plant position '{PLANT_THRESHOLD_NAME}' (index={plant_idx})"
+                        threshold_source = f"plant position '{effective_plant_threshold}' (index={plant_idx})"
                     else:
                         effective_threshold_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
-                        threshold_source = f"plant '{PLANT_THRESHOLD_NAME}' (rarity={plant_rarity})"
+                        threshold_source = f"plant '{effective_plant_threshold}' (rarity={plant_rarity})"
                 else:
-                    # configured plant not found; fallback to global rarity threshold
-                    threshold_source = f"rarity >= {RARITY_THRESHOLD_NAME} (plant threshold '{PLANT_THRESHOLD_NAME}' not found on page)"
+                    threshold_source = f"rarity >= {guild_cfg.get('rarity') if guild_cfg else RARITY_THRESHOLD_NAME} (plant threshold '{effective_plant_threshold}' not found on page)"
 
             # Decide if the inspected plant meets the effective threshold
             meets = False
@@ -413,7 +591,6 @@ async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[s
                 if name in FULL_ORDER:
                     meets = FULL_ORDER.index(name) >= plant_idx
                 else:
-                    # unknown items: fallback to rarity comparison against the plant's rarity
                     compare_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
                     meets = RARITY_PRIORITY.get(rarity, 0) >= compare_value
             else:
@@ -425,8 +602,8 @@ async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[s
             return
 
         # If no specific plant requested but plant threshold is configured, try to show what plant is being used as threshold
-        if PLANT_THRESHOLD_NAME:
-            pname_cfg = PLANT_THRESHOLD_NAME.strip().lower()
+        if effective_plant_threshold:
+            pname_cfg = effective_plant_threshold.strip().lower()
             matched_cfg = None
             for it in items:
                 if (it.get('name') or '').lower() == pname_cfg or pname_cfg in (it.get('name') or '').lower():
@@ -435,13 +612,13 @@ async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[s
             if matched_cfg:
                 p_name = matched_cfg.get('name')
                 p_rarity = matched_cfg.get('rarity')
-                lines.append(f"Configured plant threshold '{PLANT_THRESHOLD_NAME}' found on page as '{p_name}' with rarity {p_rarity}.")
+                lines.append(f"Configured plant threshold '{effective_plant_threshold}' found on page as '{p_name}' with rarity {p_rarity}.")
                 if p_name in FULL_ORDER:
                     lines.append(f"Using position-based threshold: items at or after index {FULL_ORDER.index(p_name)} in FULL_ORDER will qualify.")
                 else:
                     lines.append(f"Plant not in canonical FULL_ORDER; falling back to rarity-based threshold using rarity '{p_rarity}'.")
             else:
-                lines.append(f"Configured plant threshold '{PLANT_THRESHOLD_NAME}' was not found on the current page (tab {sel}).")
+                lines.append(f"Configured plant threshold '{effective_plant_threshold}' was not found on the current page (tab {sel}).")
 
         await ctx.send("\n".join(lines))
     except Exception as e:
@@ -461,6 +638,110 @@ async def _notify_all_guilds(message: str):
                     pass
                 break
     print(f"_notify_all_guilds: attempted to send message to {sent} guild(s)")
+    return sent
+
+async def _notify_guilds_with_items(page_url: str, items: list, threshold_source: str) -> int:
+    """Notify each guild according to its own configured threshold/plant; return number of guilds messaged.
+    items should be the list of in-stock item dicts extracted from the page (name, stockText, count, rarity).
+    This function applies per-guild filtering and per-guild dedupe state.
+    """
+    sent = 0
+    for guild in bot.guilds:
+        cfg = _get_guild_config_for(guild.id)
+        # Determine effective threshold for this guild
+        # If the guild has not configured either a rarity or plant threshold, skip notifying it.
+        if cfg.get('rarity') is None and not cfg.get('plant'):
+            # clear any previous dedupe state for this guild+page so admins can enable later
+            _last_threshold_notified.pop(f"{page_url}::{guild.id}", None)
+            continue
+
+        effective_value = RARITY_PRIORITY.get(cfg.get('rarity'), RARITY_THRESHOLD_VALUE) if cfg.get('rarity') is not None else RARITY_THRESHOLD_VALUE
+        position_mode = False
+        plant_idx = None
+        plant_rarity = None
+        # If guild configured a plant-based threshold, try to find it in the items
+        if cfg.get('plant'):
+            pname = cfg.get('plant').strip().lower()
+            matched = None
+            for it in items:
+                if (it.get('name') or '').lower() == pname or pname in (it.get('name') or '').lower():
+                    matched = it
+                    break
+            if matched:
+                plant_rarity = matched.get('rarity', 'common')
+                if matched.get('name') in FULL_ORDER:
+                    position_mode = True
+                    plant_idx = FULL_ORDER.index(matched.get('name'))
+                else:
+                    effective_value = RARITY_PRIORITY.get(plant_rarity, effective_value)
+
+        # Filter items per guild using position_mode or rarity
+        filtered = []
+        if position_mode and plant_idx is not None:
+            for it in items:
+                name = it.get('name')
+                if name in FULL_ORDER:
+                    if FULL_ORDER.index(name) >= plant_idx:
+                        filtered.append(it)
+                else:
+                    compare_value = RARITY_PRIORITY.get(plant_rarity, effective_value)
+                    if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= compare_value:
+                        filtered.append(it)
+        else:
+            filtered = [it for it in items if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= effective_value]
+
+        if not filtered:
+            # no items meet this guild's threshold
+            # clear per-guild dedupe state for this page so future finds will notify
+            _last_threshold_notified.pop(f"{page_url}::{guild.id}", None)
+            continue
+
+        # Dedupe: check previous names for this guild+page
+        current_names = {it.get('name') for it in filtered}
+        key = f"{page_url}::{guild.id}"
+        prev_names = _last_threshold_notified.get(key, set())
+        notify_on_new = cfg.get('notify_on_new_only', NOTIFY_ON_NEW_ONLY)
+        if notify_on_new:
+            new_names = current_names - prev_names
+            if not new_names and prev_names:
+                # nothing new to notify for this guild
+                _last_threshold_notified[key] = current_names
+                continue
+
+        # Choose channel: configured channel_id takes precedence
+        channel = None
+        cid = cfg.get('channel_id')
+        if cid:
+            try:
+                channel = guild.get_channel(int(cid))
+            except Exception:
+                channel = None
+        if not channel:
+            # fallback to first writable text channel
+            for c in guild.text_channels:
+                perms = c.permissions_for(guild.me or bot.user)
+                if perms.send_messages:
+                    channel = c
+                    break
+        if not channel:
+            continue
+
+        # Build message and send
+        lines = [f"@everyone MAGIC GARDEN ALERT for {guild.name}: Items found matching threshold ({threshold_source}):"]
+        for it in filtered:
+            count = it.get('count')
+            stock = it.get('stockText') or ''
+            if count is not None:
+                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
+            else:
+                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
+        try:
+            await channel.send("\n".join(lines))
+            sent += 1
+            _last_threshold_notified[key] = current_names
+        except Exception:
+            pass
+    print(f"_notify_guilds_with_items: notified {sent} guild(s)")
     return sent
 
 async def _parse_page_for_restock_and_alert(page):
@@ -597,7 +878,7 @@ async def _check_timer_and_alert(page):
                     let rarity = '';
                     if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
                     else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
-                    else if (/mythic/i.test(rarityCandidate)) rarity = 'mythic';
+                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
                     else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
                     else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
                     else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
@@ -614,27 +895,25 @@ async def _check_timer_and_alert(page):
             _last_timer_notified[page.url] = key
             return False
 
-        # Filter items that meet the configured threshold
-        candidates = [it for it in items if RARITY_PRIORITY.get(it.get('rarity','common'),0) >= RARITY_THRESHOLD_VALUE]
-        if not candidates:
+        # Filter items that appear to be in stock (exclude those with explicit NO/NO LOCAL STOCK labels)
+        in_stock = []
+        no_stock_re = re.compile(r"no\s+local\s+stock|no\s+local|no\s+stock", re.I)
+        for it in items:
+            stock_text = (it.get('stockText') or '')
+            if no_stock_re.search(stock_text):
+                continue
+            if it.get('count') is not None or re.search(r"X\s*\d+", stock_text or '', re.I):
+                in_stock.append(it)
+
+        if not in_stock:
             _last_timer_notified[page.url] = key
             return False
 
-        # Build and send message
-        trigger_str = f"{TRIGGER_MIN}:{TRIGGER_SEC:02d}"
-        lines = [f"Timer trigger {trigger_str} detected on {page.url} - items at or above {RARITY_THRESHOLD_NAME}:"]
-        for it in candidates:
-            count = it.get('count')
-            stock = it.get('stockText') or ''
-            if count is not None:
-                lines.append(f"- {it.get('name')} — {stock} ({count} units) — {it.get('rarity')}")
-            else:
-                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
-        msg = '\n'.join(lines)
+        # Instead of broadcasting one raw message to all guilds, use per-guild filtering and notify
+        sent = await _notify_guilds_with_items(page.url, in_stock, f"timer {TRIGGER_MIN}:{TRIGGER_SEC:02d}")
 
-        await _notify_all_guilds(msg)
         _last_timer_notified[page.url] = key
-        return True
+        return bool(sent)
     except Exception:
         return False
 
@@ -666,7 +945,7 @@ async def _scan_and_notify_threshold(page):
                     let rarity = '';
                     if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
                     else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
-                    else if (/mythic/i.test(rarityCandidate)) rarity = 'mythic';
+                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
                     else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
                     else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
                     else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
@@ -681,7 +960,10 @@ async def _scan_and_notify_threshold(page):
 
         if not items:
             print(f"_scan_and_notify_threshold: no items found on {getattr(page, 'url', 'unknown')}")
-            _last_threshold_notified.pop(page.url, None)
+            # clear per-page per-guild state
+            keys = [k for k in _last_threshold_notified.keys() if k.startswith(f"{page.url}::")]
+            for k in keys:
+                _last_threshold_notified.pop(k, None)
             return False
 
         # Filter to items that appear to be in stock (exclude those with explicit NO/NO LOCAL STOCK labels)
@@ -689,99 +971,21 @@ async def _scan_and_notify_threshold(page):
         no_stock_re = re.compile(r"no\s+local\s+stock|no\s+local|no\s+stock", re.I)
         for it in items:
             stock_text = (it.get('stockText') or '')
-            # If the stock label explicitly says no stock, treat as out of stock
             if no_stock_re.search(stock_text):
                 continue
-            # Otherwise, consider it in-stock (count present or an X## label)
             if it.get('count') is not None or re.search(r"X\s*\d+", stock_text or '', re.I):
                 in_stock.append(it)
 
-        # Determine effective threshold: either plant-based (if configured and found on page)
-        # or the global rarity threshold. Use the plant's rarity value when available.
-        effective_threshold_value = RARITY_THRESHOLD_VALUE
-        threshold_source = f"rarity >= {RARITY_THRESHOLD_NAME}"
-        # Position-mode allows using the canonical FULL_ORDER to include the given plant and
-        # everything rarer than it according to the authoritative ordering. If the plant
-        # is not present in FULL_ORDER we fall back to rarity-based filtering (original behavior).
-        position_mode = False
-        plant_idx = None
-        plant_rarity = None
-        if PLANT_THRESHOLD_NAME:
-            pname = PLANT_THRESHOLD_NAME.strip().lower()
-            matched = None
-            for it in items:
-                iname = (it.get('name') or '').lower()
-                if iname == pname or pname in iname:
-                    matched = it
-                    break
-            if matched:
-                plant_name = matched.get('name')
-                plant_rarity = matched.get('rarity', 'common')
-                if plant_name in FULL_ORDER:
-                    position_mode = True
-                    plant_idx = FULL_ORDER.index(plant_name)
-                    threshold_source = f"plant position '{PLANT_THRESHOLD_NAME}' (index={plant_idx})"
-                    print(f"_scan_and_notify_threshold: plant threshold '{PLANT_THRESHOLD_NAME}' matched canonical ordering at index {plant_idx}; using position-based filtering")
-                else:
-                    effective_threshold_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
-                    threshold_source = f"plant '{PLANT_THRESHOLD_NAME}' (rarity={plant_rarity})"
-                    print(f"_scan_and_notify_threshold: plant threshold '{PLANT_THRESHOLD_NAME}' found with rarity {plant_rarity}; using rarity-based filtering as fallback")
-            else:
-                print(f"_scan_and_notify_threshold: plant threshold '{PLANT_THRESHOLD_NAME}' not found on page; falling back to rarity threshold {RARITY_THRESHOLD_NAME}")
-
-        # Apply filtering either by canonical position (if enabled) or by rarity value.
-        if position_mode and plant_idx is not None:
-            in_stock_filtered = []
-            for it in in_stock:
-                name = it.get('name')
-                if name in FULL_ORDER:
-                    # Include items whose index is >= the plant's index (plant and anything rarer)
-                    if FULL_ORDER.index(name) >= plant_idx:
-                        in_stock_filtered.append(it)
-                else:
-                    # Unknown items: fall back to rarity comparison against the plant's rarity if known,
-                    # otherwise fall back to the configured rarity threshold.
-                    compare_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
-                    if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= compare_value:
-                        in_stock_filtered.append(it)
-        else:
-            in_stock_filtered = [it for it in in_stock if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= effective_threshold_value]
-
-        print(f"_scan_and_notify_threshold: found {len(items)} total items, {len(in_stock)} in-stock, {len(in_stock_filtered)} in-stock meeting threshold ({threshold_source})")
-
-        # If no in-stock items meet the threshold, clear stored state and skip
-        if not in_stock_filtered:
-            _last_threshold_notified[page.url] = set()
+        if not in_stock:
+            # clear per-page per-guild state
+            keys = [k for k in _last_threshold_notified.keys() if k.startswith(f"{page.url}::")]
+            for k in keys:
+                _last_threshold_notified.pop(k, None)
             return False
 
-        # Dedupe on the filtered in-stock names so we only notify when new threshold-passing items appear
-        current_names = {it.get('name') for it in in_stock_filtered}
-        if NOTIFY_ON_NEW_ONLY:
-            prev_names = _last_threshold_notified.get(page.url, set())
-            new_names = current_names - prev_names
-            if not new_names and prev_names:
-                print(f"_scan_and_notify_threshold: no new threshold-passing in-stock items (prev={len(prev_names)}, curr={len(current_names)})")
-                _last_threshold_notified[page.url] = current_names
-                return False
-        else:
-            # Always notify when threshold-passing items are present; still update dedupe map afterwards
-            print(f"_scan_and_notify_threshold: NOTIFY_ON_NEW_ONLY=False, will notify every scan if items present")
-
-        # Build message: include only the filtered in-stock section (threshold-passing items)
-        lines = [f"@everyone MAGIC GARDEN ALERT: Items found matching threshold ({threshold_source}):"]
-        for it in in_stock_filtered:
-            count = it.get('count')
-            stock = it.get('stockText') or ''
-            if count is not None:
-                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
-            else:
-                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
-
-        msg = "\n".join(lines)
-
-        sent = await _notify_all_guilds(msg)
+        # Use the new per-guild notifier which will apply each guild's config and dedupe separately.
+        sent = await _notify_guilds_with_items(page.url, in_stock, "server-configured threshold")
         print(f"_scan_and_notify_threshold: notification sent={bool(sent)} to {sent} guild(s)")
-        _last_threshold_notified[page.url] = current_names
         return bool(sent)
     except Exception as e:
         print(f"_scan_and_notify_threshold: error: {e}")
