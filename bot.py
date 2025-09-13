@@ -8,6 +8,7 @@ import argparse
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
+import time
 
 # If you installed Playwright browsers in a local cache, prefer that before importing Playwright
 os.environ.setdefault(
@@ -994,6 +995,47 @@ async def _scan_and_notify_threshold(page):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    # Reload persisted guild settings and apply them to any guilds we're currently in.
+    # This makes sure configurations saved to guild_settings.json are actually reloaded
+    # and validated when the bot restarts so server admins don't need to reconfigure.
+    _load_guild_settings()
+
+    # Validate and apply per-guild settings: check that configured channel IDs still exist
+    # and populate missing keys with sensible defaults. Persist any corrections.
+    changed = False
+    applied_count = 0
+    for gid_str, cfg in list(GUILD_SETTINGS.items()):
+        try:
+            gid = int(gid_str)
+        except Exception:
+            continue
+        guild = bot.get_guild(gid)
+        if not guild:
+            # Guild not available (bot may have been removed) — keep config on disk for future use
+            continue
+        applied_count += 1
+        # Ensure notify_on_new_only field exists
+        if 'notify_on_new_only' not in cfg:
+            cfg['notify_on_new_only'] = NOTIFY_ON_NEW_ONLY
+            GUILD_SETTINGS[gid_str] = cfg
+            changed = True
+        # Validate channel_id: if configured but channel no longer exists, clear it
+        cid = cfg.get('channel_id')
+        if cid is not None:
+            try:
+                ch = guild.get_channel(int(cid))
+            except Exception:
+                ch = None
+            if ch is None:
+                cfg.pop('channel_id', None)
+                GUILD_SETTINGS[gid_str] = cfg
+                changed = True
+
+    if changed:
+        _save_guild_settings()
+
+    print(f"Applied saved settings for {applied_count} guild(s)")
+
     # NOTE: Do not auto-start the periodic watcher here unless --periodic-start was provided.
     if PERIODIC_START_TIME:
         async def _schedule_start():
@@ -1020,14 +1062,23 @@ async def on_ready():
 
 # New: periodic seed check task (default 5 minutes) and control commands
 async def _periodic_seed_check(interval_seconds: int = PERIODIC_INTERVAL_SECONDS):
-    """Periodically run a single seed check across attached pages every interval_seconds."""
+    """Periodically run a single seed check across attached pages every interval_seconds.
+    Uses a monotonic clock to keep iteration START times spaced evenly to avoid drift.
+    """
+    # Schedule the first iteration to start immediately (monotonic anchor)
+    next_start = time.monotonic()
     while True:
         try:
+            # Mark the start of this iteration
+            start = time.monotonic()
+
             attached = await _ensure_attached(CDP_DEFAULT)
             print(f"_periodic_seed_check: _ensure_attached -> {attached}")
             if not attached:
                 # wait and retry next loop
                 await asyncio.sleep(interval_seconds)
+                # adjust the anchor so we don't accumulate drift when endpoint is missing
+                next_start = time.monotonic()
                 continue
 
             pages = await _get_pages()
@@ -1061,7 +1112,15 @@ async def _periodic_seed_check(interval_seconds: int = PERIODIC_INTERVAL_SECONDS
                     print(f"_periodic_seed_check: per-page top-level error for {getattr(page,'url','unknown')}: {e}")
         except Exception as e:
             print(f"_periodic_seed_check: top-level error: {e}")
-        await asyncio.sleep(interval_seconds)
+
+        # Compute next scheduled start and sleep the remaining time using monotonic clock
+        next_start += interval_seconds
+        sleep_for = next_start - time.monotonic()
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
+        else:
+            # Overrun: the work took longer than the interval. Log and continue immediately.
+            print(f"_periodic_seed_check: iteration overran by {-sleep_for:.1f}s; continuing immediately")
 
 @bot.command(name="start_periodic_check")
 @commands.is_owner()
