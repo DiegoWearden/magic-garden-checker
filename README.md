@@ -1,104 +1,192 @@
 # Magic Garden Checker
 
-A small Discord bot that attaches to a user-managed Chromium via CDP and watches the Magic Garden shop page for items and restocks. It can run one-off checks, periodic scans, and send automatic alerts when items matching configured filters are detected.
+A small Discord bot that attaches to an external Chromium/Chrome (via CDP) and watches the Magic Garden shop page for items and restocks. It supports one-off checks, periodic scans, and automatic alerts when items matching configured filters are detected.
 
-Features
-- Attach to an external Chromium/Chrome/Chromium-based browser via CDP (no embedded browser launched automatically).
-- One-off checks: fetch page HTML, screenshot, list in-stock items.
-- Periodic scans with optional schedule (interpreted in America/Chicago timezone).
-- Automatic notifications for items that are in-stock and meet a rarity threshold (deduped so you only get alerts on new items).
-- Owner-only control commands for starting/stopping scans and changing thresholds.
+---
 
-Prerequisites
-- Python 3.9+ (ZoneInfo used)
-- An external Chromium/Chrome running with remote debugging enabled (or Playwright browsers with a CDP endpoint)
-- A Discord bot token and the bot invited to your server with send_messages permission
+## Quick overview
+- The bot attaches to a browser's CDP endpoint (it will not launch a browser for you).
+- Use the Discord commands below to run checks, take screenshots, and configure server thresholds.
+- Keep a Chromium tab open with the shop page(s) you want the bot to inspect.
 
-Install
-1. Create a virtualenv and activate it:
+---
 
-   python -m venv venv
-   source venv/bin/activate
+## Prerequisites
+- Python 3.9+
+- An external Chromium/Chrome running with remote debugging enabled, or Playwright with an exposed CDP endpoint
+- A Discord bot token (bot invited to your server with send_messages permission)
 
-2. Install Python dependencies:
+---
 
-   pip install -r requirements.txt
+## Install
+Create and activate a virtualenv, then install dependencies:
 
-3. If you installed Playwright via pip and want to use Playwright browsers, run:
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-   playwright install
+If you installed Playwright and want to use Playwright browsers:
 
-Run a Chromium instance for CDP (example using Chrome/Chromium):
+```bash
+playwright install
+```
 
-- Google Chrome / Chromium:
+---
 
-  chromium-browser --headless=new \
-    --remote-debugging-address=127.0.0.1 \
-    --remote-debugging-port=9222 \
-    --user-data-dir=/home/diego/chrome-profile \
-    --disable-gpu --no-first-run --no-default-browser-check \
-    https://magiccircle.gg/r/LDQK
+## Run a Chromium instance for CDP
+Example using Google Chrome / Chromium (adjust paths/URL):
 
-This makes a CDP endpoint available at http://127.0.0.1:9222 (the default the bot uses).
+```bash
+chromium-browser --headless=new \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/home/diego/chrome-profile \
+  --disable-gpu --no-first-run --no-default-browser-check \
+  https://magiccircle.gg/r/LDQK
+```
 
-Configuration
-Create a .env file in the project directory with at least:
+This exposes a CDP endpoint at: http://127.0.0.1:9222
 
+---
+
+## Configuration (.env)
+Create a `.env` file in the project directory. Minimal required setting:
+
+```env
 DISCORD_TOKEN=your_bot_token_here
-# Optional overrides
+```
+
+Optional overrides (examples):
+
+```env
+# CDP endpoint (default used by the bot)
 CDP_DEFAULT=http://127.0.0.1:9222
+
+# Default rarity threshold for automatic alerts
 RESTOCK_RARITY_THRESHOLD=mythic
+```
 
-Key settings
-- DISCORD_TOKEN: required. The bot token used to log in.
-- CDP_DEFAULT: the CDP endpoint to attach to (default: http://127.0.0.1:9222).
-- RESTOCK_RARITY_THRESHOLD: default rarity threshold for automatic alerts (common, uncommon, rare, epic, legendary, mythic).
+Valid rarities: `common`, `uncommon`, `rare`, `epic`, `legendary`, `mythic`.
 
-Usage
-Start the bot normally:
+---
 
-   python bot.py
+## Start the bot
+Run the bot normally:
 
-Start the bot and schedule the periodic checker to start at a Chicago time:
+```bash
+python bot.py
+```
 
-   python bot.py --periodic-start 10:37:01pm
+Start the bot and schedule the periodic checker to start at a Chicago time (interprets input as America/Chicago):
 
-(Startup schedule is interpreted as America/Chicago time and converted to the host clock.)
+```bash
+python bot.py --periodic-start 10:37:01pm
+```
 
-Discord commands
-- !help
-  Show help (lists commands and usage).
+---
+
+## Discord commands (copyable)
+Each command is listed on its own line so you can copy/paste directly into Discord.
+
+General
+
+```
+!help
+```
 
 Owner-only commands
-- !set_threshold <rarity>
-  Set the restock rarity threshold. Valid: common, uncommon, rare, epic, legendary, mythic
-- !start_periodic_check [minutes]
-  Start periodic scans every X minutes (default 5).
-- !stop_periodic_check
-  Stop the periodic scanner.
-- !run_seed_check
-  Run a one-off immediate scan and (if matches) send alerts.
 
-Utility commands (anyone)
-- !current_html [index] [endpoint]
-  Return HTML of the attached page (index defaults to 0). Useful for debugging selectors.
-- !screenshot [index] [full] [endpoint]
-  Take a screenshot. Use `true` for full-page capture.
-- !in_stock [index] [endpoint]
-  List items currently detected as in-stock on the selected page.
+```
+!start_periodic_check [minutes]
+```
 
-Behavior notes
-- The bot attaches to an external browser tab. Make sure the shop page is open in that browser.
-- Notifications are deduped per-page; the bot remembers which item names have already triggered alerts and will only notify again when new names appear. Restarting the bot clears in-memory state.
-- If you need the bot to always notify (even for the same items), ask to add a command to clear the dedupe cache or to disable dedupe.
+```
+!stop_periodic_check
+```
 
-Troubleshooting
-- If the scheduled start appears to be many hours away, check the host clock/timezone. The scheduled input is interpreted in America/Chicago. Run `date` or `timedatectl status` on the host to verify.
-- If no items are detected, run `!current_html` or `!screenshot` and inspect the output; selectors are based on button.chakra-button and p.chakra-text.css-swfl2y.
-- If the bot cannot attach to CDP, ensure Chrome is running with --remote-debugging-port and CDP_DEFAULT matches the endpoint.
+```
+!run_seed_check
+```
 
-Development notes
-- The bot uses the Playwright CDP connector to attach to an external browser. You can also use a Playwright-launched browser and expose its CDP endpoint.
+```
+!set_plant_threshold <plant name>
+```
 
-License
-- This repository contains user-specific scripts and is provided as-is. Modify at your own risk.
+```
+!clear_plant_threshold
+```
+
+Server administrator commands
+
+```
+!set_server_threshold <rarity>
+```
+
+```
+!set_server_plant <plant name>
+```
+
+```
+!clear_server_plant
+```
+
+```
+!set_server_notify_new_only <true|false>
+```
+
+```
+!set_server_channel <channel_id>
+```
+
+```
+!show_server_settings
+```
+
+Utility / Debugging commands
+
+```
+!check_threshold [index] [endpoint] ["Plant Name"]
+```
+
+```
+!current_html [index] [endpoint]
+```
+
+```
+!screenshot [index] [full] [endpoint]
+```
+
+```
+!in_stock [index] [endpoint]
+```
+
+```
+!list_plants
+```
+
+---
+
+## Behavior notes
+- The bot attaches to an external browser tab. Make sure the shop page is open in that browser instance.
+- Notifications are deduped per-page; the bot remembers which item names already triggered alerts and will only notify again when new names appear. Restarting the bot clears in-memory state.
+- If a server has neither a rarity nor a plant threshold configured, it will not receive automatic notifications.
+- Use `!list_plants` to get exact plant/item names for `!set_plant_threshold` or `!set_server_plant`.
+
+---
+
+## Troubleshooting
+- Scheduled start time appears many hours away: the input is interpreted in America/Chicago; verify the host clock/timezone (`date` or `timedatectl status`).
+- No items detected: run `!current_html` or `!screenshot` to inspect the page and confirm selectors.
+- Bot cannot attach to CDP: ensure Chrome is running with `--remote-debugging-port` and that `CDP_DEFAULT` matches the endpoint.
+
+---
+
+## Development notes
+- The bot uses a Playwright CDP connector to attach to external browsers but can also use Playwright-launched browsers with an exposed CDP endpoint.
+
+---
+
+## License
+Provided as-is. Modify at your own risk.
