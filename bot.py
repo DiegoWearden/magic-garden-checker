@@ -1025,6 +1025,38 @@ async def on_message(message: discord.Message):
                 lines.append(f"{kind}: remain={_fmt_secs(remain)} period={int(period) if period else 'N/A'}s")
             await message.channel.send("```\n" + "\n".join(lines) + "\n```")
 
+    elif cmd == '!in_stock':
+        # Show all available items (currentStock > 0) for every kind
+        with state_lock:
+            cur = last_normalized
+        if not cur or not cur.get('shops'):
+            await message.channel.send("No shop snapshot available yet. Try again in a moment.")
+            return
+        shops = cur.get('shops', {})
+        parts = []
+        total = 0
+        # Keep order consistent
+        for kind in ('seed', 'egg', 'tool', 'decor'):
+            s = shops.get(kind)
+            if not s:
+                continue
+            inv = (s.get('inventory') or [])
+            inv = [i for i in inv if int(i.get('currentStock', 0)) > 0]
+            if not inv:
+                continue
+            total += len(inv)
+            items_str = ", ".join(f"{_pretty_label_for_name(i.get('name'))} (x{int(i.get('currentStock', 0))})" for i in inv)
+            parts.append(f"**{kind.title()}**: {items_str}")
+
+        if not parts:
+            await message.channel.send("No items are currently in stock.")
+            return
+
+        msg = f"Items in stock ({total}):\n" + "\n".join(parts)
+        if len(msg) > 1900:
+            msg = msg[:1900] + '\n...truncated'
+        await message.channel.send(msg)
+
 # ---------- Run ----------
 if __name__ == '__main__':
     if not DISCORD_TOKEN:
