@@ -21,6 +21,7 @@ import os, io, json, time, threading, re
 from typing import Any, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 from collections import defaultdict
+import asyncio
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -633,10 +634,9 @@ def monitor_loop(notifier: DiscordNotifier):
                     with state_lock:
                         for k in kinds_to_report:
                             pending_print_kinds.add(k)
-                    # clear previous snapshot marker and ask monitor thread to reload (force bypasses cooldown)
-                    snapshot_updated.clear()
-                    force_refresh_requested.set()
-                    waited = snapshot_updated.wait(timeout=8.0)
+                    # Ask the monitor thread to reload and wait for a fresh snapshot before reporting
+                    waited = request_refresh_and_wait(force=True, timeout=8.0)
+                    
                 except Exception:
                     waited = False
 
@@ -1004,6 +1004,8 @@ async def on_message(message: discord.Message):
             await message.channel.send(f'Failed to send snapshot: {e}')
 
     elif cmd == '!shop_debug':
+        # Refresh before reporting debug timers so info is up-to-date
+        await asyncio.to_thread(request_refresh_and_wait, True, 8.0)
         with state_lock:
             if not restock_timers:
                 await message.channel.send("No timers yet.")
@@ -1017,7 +1019,8 @@ async def on_message(message: discord.Message):
             await message.channel.send("```\n" + "\n".join(lines) + "\n```")
 
     elif cmd == '!in_stock':
-        # Show all available items (currentStock > 0) for every kind
+        # Refresh before checking stock so the listing is current
+        await asyncio.to_thread(request_refresh_and_wait, True, 8.0)
         with state_lock:
             cur = last_normalized
         if not cur or not cur.get('shops'):
@@ -1101,3 +1104,21 @@ if __name__ == '__main__':
         print('Missing DISCORD_TOKEN in environment/.env')
         raise SystemExit(1)
     client.run(DISCORD_TOKEN)
+
+def request_refresh_and_wait(force: bool = True, timeout: float = 8.0) -> bool:
+    """Request a monitor refresh and wait for a fresh snapshot.
+    Can be called from any thread. Returns True if a fresh snapshot was seen within timeout.
+    """
+    try:
+        # Clear previous snapshot marker and request refresh
+        snapshot_updated.clear()
+        if force:
+            force_refresh_requested.set()
+        else:
+            refresh_requested.set()
+        # Wait for monitor thread to capture a fresh snapshot
+        return snapshot_updated.wait(timeout=timeout)
+    finally:
+        # Ensure we don't leave the request flag set if wait timed out or succeeded
+        refresh_requested.clear()
+        force_refresh_requested.clear()
