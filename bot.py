@@ -21,7 +21,6 @@ import os, io, json, time, threading, re
 from typing import Any, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 from collections import defaultdict
-import asyncio
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -55,8 +54,6 @@ MIN_REFRESH_COOLDOWN_SEC = 8.0
 
 # ---------- State (shared across threads; guard with state_lock) ----------
 state_lock = threading.Lock()
-written_first_snapshot = threading.Event()
-snapshot_updated = threading.Event()
 
 full_state: Dict[str, Any] = {}
 last_normalized: Optional[Dict[str, Any]] = None
@@ -74,7 +71,6 @@ last_refresh_at = 0.0  # guarded by state_lock
 pending_print_kinds: Set[str] = set()  # guarded by state_lock
 
 # In-memory snapshot buffer
-last_snapshot_bytes: bytes = b""
 
 # ---------- Files ----------
 GUILD_SETTINGS_PATH = ROOT / 'guild_settings.json'        # existing general config (optional)
@@ -265,8 +261,9 @@ def set_guild_watch(guild_id: int, items: List[str]):
 # If guild has a non-empty watchlist, filter notifications to ONLY those items.
 def filter_inventory_by_watch(inv: List[Dict[str, Any]], guild_id: int) -> List[Dict[str, Any]]:
     watched = get_guild_watch(guild_id)
+    # If no watchlist configured for this guild, do not filter — return full inventory
     if not watched:
-        return []
+        return inv
     watched_keys: Set[str] = set()
     for w in watched:
         watched_keys.add(_sk(w))
@@ -345,14 +342,33 @@ def apply_patches(root: Any, patches: List[Dict[str, Any]]) -> Any:
 # ---------- Normalization ----------
 def _current_stock(item: Dict[str, Any]) -> int:
     for k in ("remainingStock", "currentStock", "stock", "available", "qty", "quantity"):
-        if k in item and isinstance(item[k], (int, float)):
-            return int(item[k])
+        if k in item:
+            val = item[k]
+            # direct numeric types
+            if isinstance(val, (int, float)):
+                return int(val)
+            # try to parse numeric strings like "5" or "5.0"
+            if isinstance(val, str):
+                try:
+                    s = val.strip()
+                    if s == "":
+                        continue
+                    # allow integer or float textual values
+                    if re.match(r'^-?\d+(?:\.\d+)?$', s):
+                        return int(float(s))
+                except Exception:
+                    pass
+    # fallback to initialStock - sold if present
     if "initialStock" in item and "sold" in item:
         try:
-            return max(int(item["initialStock"]) - int(item["sold"]), 0)
+            return max(int(item.get("initialStock", 0) or 0) - int(item.get("sold", 0) or 0), 0)
         except Exception:
             pass
-    return int(item.get("initialStock", 0) or 0)
+    # final fallback to initialStock (or 0)
+    try:
+        return int(item.get("initialStock", 0) or 0)
+    except Exception:
+        return 0
 
 def _display_name(item: Dict[str, Any]) -> str:
     return (item.get("displayName")
@@ -554,21 +570,42 @@ class DiscordNotifier:
                 ch = self._find_channel_for_guild(guild, cfg)
                 if not ch:
                     continue
-                inv_all = (kind_shop or {}).get('inventory', []) or []
+                # Always read the freshest normalized state under the state lock
+                with state_lock:
+                    cur = None if last_normalized is None else last_normalized
+                if cur and cur.get('shops') and cur['shops'].get(kind):
+                    kind_shop_now = cur['shops'].get(kind)
+                else:
+                    kind_shop_now = (kind_shop or {})
+
+                inv_all = (kind_shop_now or {}).get('inventory', []) or []
+                # ensure we consider numeric strings etc using the same logic as normalization
                 inv_all = [i for i in inv_all if int(i.get('currentStock', 0)) > 0] if PRINT_ONLY_AVAILABLE else inv_all
+
+                # Filter by guild watchlist if present
                 inv = filter_inventory_by_watch(inv_all, guild.id)
                 if not inv:
                     continue
+
                 header = f"@everyone\n**MAGIC GARDEN ALERT, {kind.capitalize()} restocked:**\n\n"
                 item_lines = []
                 for it in inv[:50]:
+                    # Use the normalized display name if available
                     raw = it.get('name') or _display_name(it)
+                    # Derive canonical key and pretty display
                     ck = _canonical_vocab_key(raw)
                     disp = ck.title() if ck else (raw or 'unknown')
-                    cur = int(it.get('currentStock', 0))
+                    # Robustly compute current stock (in case fields are strings)
+                    try:
+                        cur_stock = int(it.get('currentStock', 0))
+                    except Exception:
+                        try:
+                            cur_stock = int(float(str(it.get('currentStock', 0)).strip()))
+                        except Exception:
+                            cur_stock = 0
                     rr = ITEM_RARITIES.get(ck or '', '')
                     rc = rr.capitalize() if rr else ''
-                    item_lines.append(f"{disp} — X {cur}" + (f" — {rc}" if rc else ""))
+                    item_lines.append(f"{disp} — X {cur_stock}" + (f" — {rc}" if rc else ""))
                 msg = header + "\n".join(item_lines)
                 if len(msg) > 1900:
                     msg = msg[:1900] + '\n...truncated'
@@ -586,22 +623,7 @@ class DiscordNotifier:
 # ---------- Monitor (Playwright) ----------
 def monitor_loop(notifier: DiscordNotifier):
     """Runs on its own thread. All Playwright actions happen here."""
-    global full_state, last_normalized, restock_timers, last_refresh_at, last_snapshot_bytes
-
-    def write_snapshot_if_changed(snapshot: Dict[str, Any], reason: str = ""):
-        """Keep snapshot in memory; optionally write to disk and/or log."""
-        global last_snapshot_bytes
-        try:
-            # Keep the snapshot in-memory so the administrative command can still return it,
-            # but do not perform any disk writes or noisy logging/notifications here.
-            data = json.dumps(snapshot, indent=2).encode("utf-8")
-            last_snapshot_bytes = data
-            # Signal that we have at least one snapshot available (so monitor can proceed)
-            written_first_snapshot.set()
-            # Signal that a fresh snapshot was captured (used by countdown to await refresh)
-            snapshot_updated.set()
-        except Exception as e:
-            _dprint(f"[ERROR] Failed to capture snapshot: {e}")
+    global full_state, last_normalized, restock_timers, last_refresh_at
 
     # ---- countdown thread (no Playwright here) ----
     def countdown_loop():
@@ -630,13 +652,19 @@ def monitor_loop(notifier: DiscordNotifier):
             # Local report without forced reload
             if kinds_to_report:
                 try:
-                    # Mark these kinds so the monitor thread can print/notify them if a fresh snapshot arrives.
+                    # Mark these kinds so the monitor thread can print/notify them if a fresh state arrives.
                     with state_lock:
+                        prev_snapshot = last_normalized
                         for k in kinds_to_report:
                             pending_print_kinds.add(k)
-                    # Ask the monitor thread to reload and wait for a fresh snapshot before reporting
-                    waited = request_refresh_and_wait(force=True, timeout=8.0)
-                    
+                    # ask monitor thread to reload (force bypasses cooldown)
+                    force_refresh_requested.set()
+                    # wait a short fixed interval for the monitor to process incoming frames
+                    time.sleep(2.0)
+                    with state_lock:
+                        cur_snapshot = last_normalized
+                    # consider that we 'waited' only if the normalized snapshot object changed
+                    waited = (cur_snapshot is not None and cur_snapshot is not prev_snapshot)
                 except Exception:
                     waited = False
 
@@ -648,13 +676,13 @@ def monitor_loop(notifier: DiscordNotifier):
                             already_handled = (k not in pending_print_kinds)
                             if already_handled:
                                 continue
-                            # If we didn't get a fresh snapshot, skip sending (require refresh before notify)
+                            # If we didn't get a fresh normalized state, skip sending (require reload before notify)
                             if not waited:
-                                _dprint(f"[LOCAL] Skipping {k} because no fresh snapshot was received after refresh.")
+                                _dprint(f"[LOCAL] Skipping {k} because no fresh normalized state was received after refresh.")
                                 # leave the pending flag in place so the monitor may still handle it later
                                 continue
                             if cur and cur.get('shops') and cur['shops'].get(k):
-                                _dprint(f"[LOCAL] Reporting {k} after fresh snapshot.")
+                                _dprint(f"[LOCAL] Reporting {k} after fresh normalized state.")
                                 _print_available(k, cur['shops'].get(k, {}))
                                 notifier.notify_restock(k, cur['shops'].get(k, {}))
                                 # mark as handled locally
@@ -686,6 +714,19 @@ def monitor_loop(notifier: DiscordNotifier):
 
             t = obj.get('type')
 
+            # Debug: print a short line for every relevant WebSocket frame so we can observe repeated activity
+            try:
+                # print type and payload length; if DEBUG also print a payload excerpt
+                _dprint(f"[WS_FRAME] type={t} len={len(payload)}")
+                if DEBUG:
+                    try:
+                        excerpt = payload if len(payload) <= 2000 else payload[:2000] + '...'
+                        _dprint(f"[WS_PAYLOAD_EXCERPT] {excerpt}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             if t == 'Welcome':
                 fs = obj.get('fullState') or {}
                 with state_lock:
@@ -702,11 +743,16 @@ def monitor_loop(notifier: DiscordNotifier):
                             period = restock_timers.get(kind, {}).get('period', DEFAULT_PERIODS.get(kind, float(secs)))
                             restock_timers[kind] = {'secs': float(secs), 't0': now, 'period': float(period)}
 
-                    # Capture snapshot in-memory but do not notify or write files.
-                    write_snapshot_if_changed(cur, reason="welcome")
+                    # Immediately print the normalized JSON (no snapshot storage)
+                    try:
+                        _dprint("[NORMALIZED] (welcome)\n" + json.dumps(cur, indent=2))
+                    except Exception:
+                        _dprint("[NORMALIZED] (welcome) captured")
+
+                    # If any kinds were marked pending, print and notify them now
                     if pending_print_kinds:
                         for kind in sorted(pending_print_kinds):
-                            _dprint(f"[WELCOME] Fresh snapshot received; printing {kind}.")
+                            _dprint(f"[WELCOME] Fresh normalized state received; printing {kind}.")
                             _print_available(kind, cur['shops'].get(kind, {}))
                             notifier.notify_restock(kind, cur['shops'].get(kind, {}))
                         pending_print_kinds.clear()
@@ -742,8 +788,19 @@ def monitor_loop(notifier: DiscordNotifier):
                                     _dbg(f"{kind} period updated via server reset → {cur_secs}s")
 
                     last_normalized = cur
-                    # Capture snapshot in-memory but do not notify or write files.
-                    write_snapshot_if_changed(cur, reason="partial")
+                    # Immediately print the normalized JSON (no snapshot storage)
+                    try:
+                        _dprint("[NORMALIZED] (partial)\n" + json.dumps(cur, indent=2))
+                    except Exception:
+                        _dprint("[NORMALIZED] (partial) captured")
+
+                    # If any kinds were marked pending, print and notify them now
+                    if pending_print_kinds:
+                        for kind in sorted(pending_print_kinds):
+                            _dprint(f"[PARTIAL] Fresh normalized state received; printing {kind}.")
+                            _print_available(kind, cur['shops'].get(kind, {}))
+                            notifier.notify_restock(kind, cur['shops'].get(kind, {}))
+                        pending_print_kinds.clear()
 
         client.on('Network.webSocketFrameReceived', on_ws_frame)
 
@@ -757,9 +814,12 @@ def monitor_loop(notifier: DiscordNotifier):
         # Start countdown printer
         threading.Thread(target=countdown_loop, daemon=True).start()
 
-        # Wait for first snapshot (best effort)
+        # Wait for first normalized state (best effort)
         deadline = time.time() + MAX_WAIT_SEC
-        while time.time() < deadline and not written_first_snapshot.is_set():
+        while time.time() < deadline:
+            with state_lock:
+                if last_normalized is not None:
+                    break
             time.sleep(0.1)
 
         _dprint("[MONITOR] Running. Press Ctrl+C to stop this process.")
@@ -964,31 +1024,93 @@ async def shop_watch_view(interaction: discord.Interaction):
         await interaction.response.send_message("This server has **no watchlist** set. Use `/shop_watch` to configure.", ephemeral=True)
         return
     # Map back to pretty labels with rarity
-    labels = [lbl for (lbl,val,_r) in ITEM_OPTIONS if val in sel]
+    labels = [lbl for (lbl,val,r) in ITEM_OPTIONS if val in sel]
     labels.sort()
     preview = "\n".join(labels[:30])
     extra = f"\n...and {len(labels)-30} more" if len(labels) > 30 else ""
     await interaction.response.send_message(f"Watched items (**{len(labels)}**):\n{preview}{extra}", ephemeral=True)
 
-# ---------- Help command (slash) ----------
-@tree.command(name="help", description="Show available commands and brief usage.")
-async def help_command(interaction: discord.Interaction):
-    help_lines = [
-        "Available commands:",
-        "Slash commands:",
-        "  /shop_watch — Configure which items this server will be notified about (ephemeral UI).",
-        "  /shop_watch_view — Show the current watchlist for this server (ephemeral).",
-        "  /help — Show this help message.",
-        "Message commands (prefix):",
-        "  !in_stock — List all items currently in stock.",
-        "  !shop_debug — Show internal timer/debug info (admins/developers).",
-        "  !shop_snapshot — (disabled) previously wrote a snapshot to disk.",
-        "  !help — Show this help message.",
-        "Watchlist notes:",
-        "  Use /shop_watch to open the ephemeral checklist UI. Selections are saved per-server in guild_watchlist.json.",
-    ]
-    msg = "\n".join(help_lines)
-    await interaction.response.send_message(msg, ephemeral=True)
+@tree.command(name="shop_stock", description="Show current shop stock snapshot (ephemeral).")
+async def shop_stock(interaction: discord.Interaction):
+    """Return the current in-memory shop snapshot (captured by the monitor thread).
+
+    The response is ephemeral and will include available items per kind.
+    """
+    await interaction.response.defer(ephemeral=True)
+    # Grab the latest normalized snapshot under the state lock
+    with state_lock:
+        cur = None if last_normalized is None else json.loads(json.dumps(last_normalized))
+
+    if not cur:
+        await interaction.followup.send("No snapshot available yet. Please try again shortly.", ephemeral=True)
+        return
+
+    captured = cur.get('captured_at')
+    shops = cur.get('shops', {})
+
+    lines = []
+    if captured:
+        lines.append(f"Captured: {time.ctime(captured)}")
+    for kind in ('seed', 'egg', 'tool', 'decor'):
+        kind_shop = shops.get(kind)
+        if not kind_shop:
+            lines.append(f"{kind.title()}: (no data)")
+            continue
+        inv = kind_shop.get('inventory', []) or []
+        if PRINT_ONLY_AVAILABLE:
+            inv = [i for i in inv if int(i.get('currentStock', 0)) > 0]
+        if not inv:
+            lines.append(f"{kind.title()}: (no items with stock > 0)")
+            continue
+        item_lines = []
+        for it in inv[:50]:
+            raw = it.get('name') or _display_name(it)
+            ck = _canonical_vocab_key(raw)
+            disp = ck.title() if ck else (raw or 'unknown')
+            curstock = int(it.get('currentStock', 0))
+            init = int(it.get('initialStock', 0))
+            rr = ITEM_RARITIES.get(ck or '', '')
+            rc = rr.capitalize() if rr else ''
+            item_lines.append(f"{disp} — {curstock}/{init}" + (f" — {rc}" if rc else ""))
+        header = f"{kind.title()} ({len(item_lines)} available):"
+        body = "; ".join(item_lines[:10])
+        if len(item_lines) > 10:
+            body += f"; ...and {len(item_lines)-10} more"
+        lines.append(header + " " + body)
+
+    msg = "\n".join(lines)
+    if len(msg) > 1900:
+        msg = msg[:1900] + '\n...truncated'
+    await interaction.followup.send(msg, ephemeral=True)
+
+# ---------- Events ----------
+@client.event
+async def on_ready():
+    global monitor_thread
+    _dprint(f"[DISCORD] Logged in as {client.user} (id={client.user.id})")
+    # Load and report saved watchlist counts for visibility
+    try:
+        wl = load_watchlist()
+        total_guilds = len(wl)
+        total_items = sum(len(v) for v in wl.values())
+        _dprint(f"[WATCHLIST] Loaded watchlist for {total_guilds} guild(s), {total_items} total selections.")
+    except Exception:
+        pass
+    # Start monitor thread once
+    if monitor_thread is None or not monitor_thread.is_alive():
+        monitor_thread = threading.Thread(target=monitor_loop, args=(notifier,), daemon=True)
+        monitor_thread.start()
+
+    # Sync slash commands to each guild for fast availability
+    try:
+        for g in client.guilds:
+            await tree.sync(guild=g)
+        # Also do a global sync (optional, slower to propagate)
+        await tree.sync()
+        _dprint(f"[DISCORD] Slash commands synced to {len(client.guilds)} guild(s) + global.")
+    except Exception as e:
+        _dprint(f"[WARN] command sync failed: {e}")
+
 
 # Optional message commands you already had
 @client.event
@@ -1004,8 +1126,6 @@ async def on_message(message: discord.Message):
             await message.channel.send(f'Failed to send snapshot: {e}')
 
     elif cmd == '!shop_debug':
-        # Refresh before reporting debug timers so info is up-to-date
-        await asyncio.to_thread(request_refresh_and_wait, True, 8.0)
         with state_lock:
             if not restock_timers:
                 await message.channel.send("No timers yet.")
@@ -1018,107 +1138,9 @@ async def on_message(message: discord.Message):
                 lines.append(f"{kind}: remain={_fmt_secs(remain)} period={int(period) if period else 'N/A'}s")
             await message.channel.send("```\n" + "\n".join(lines) + "\n```")
 
-    elif cmd == '!in_stock':
-        # Refresh before checking stock so the listing is current
-        await asyncio.to_thread(request_refresh_and_wait, True, 8.0)
-        with state_lock:
-            cur = last_normalized
-        if not cur or not cur.get('shops'):
-            await message.channel.send("No shop snapshot available yet. Try again in a moment.")
-            return
-        shops = cur.get('shops', {})
-        parts = []
-        total = 0
-        # Keep order consistent
-        for kind in ('seed', 'egg', 'tool', 'decor'):
-            s = shops.get(kind)
-            if not s:
-                continue
-            inv = (s.get('inventory') or [])
-            inv = [i for i in inv if int(i.get('currentStock', 0)) > 0]
-            if not inv:
-                continue
-            total += len(inv)
-            # Build a multi-line list: one item per line
-            item_lines = []
-            for i in inv:
-                label = _pretty_label_for_name(i.get('name'))
-                count = int(i.get('currentStock', 0))
-                item_lines.append(f"- {label} (x{count})")
-            items_str = "\n".join(item_lines)
-            parts.append(f"**{kind.title()}**:\n{items_str}")
-
-        if not parts:
-            await message.channel.send("No items are currently in stock.")
-            return
-
-        msg = f"Items in stock ({total}):\n" + "\n\n".join(parts)
-        if len(msg) > 1900:
-            msg = msg[:1900] + '\n...truncated'
-        await message.channel.send(msg)
-
-    elif cmd == '!help':
-        help_text = (
-            "Available commands:\n"
-            "Slash commands:\n"
-            "  /shop_watch — Configure which items this server will be notified about (ephemeral UI).\n"
-            "  /shop_watch_view — Show the current watchlist for this server (ephemeral).\n"
-            "  /help — Show this help message.\n"
-            "Message commands (prefix):\n"
-            "  !in_stock — List all items currently in stock.\n"
-            "  !shop_debug — Show internal timer/debug info.\n"
-            "  !shop_snapshot — (disabled) previously wrote a snapshot to disk.\n"
-            "  !help — Show this help message.\n"
-            "Watchlist notes:\n"
-            "  Use /shop_watch to open the ephemeral checklist UI. Selections are saved per-server in guild_watchlist.json."
-        )
-        try:
-            await message.channel.send(help_text)
-        except Exception:
-            pass
-
-@client.event
-async def on_ready():
-    """Start background monitor thread once the Discord client is ready."""
-    global monitor_thread
-    try:
-        _dprint(f"[BOT] Logged in as {client.user} (id={client.user.id})")
-    except Exception:
-        _dprint("[BOT] Logged in (client.user not available)")
-    # Ensure application commands are synced so slash commands are available
-    try:
-        await tree.sync()
-        _dprint("[BOT] Slash commands synced.")
-    except Exception as e:
-        _dprint(f"[WARN] Failed to sync slash commands: {e}")
-
-    # Start monitor thread if not already running
-    if monitor_thread is None:
-        monitor_thread = threading.Thread(target=monitor_loop, args=(notifier,), daemon=True)
-        monitor_thread.start()
-        _dprint("[BOT] Monitor thread started.")
-
 # ---------- Run ----------
 if __name__ == '__main__':
     if not DISCORD_TOKEN:
         print('Missing DISCORD_TOKEN in environment/.env')
         raise SystemExit(1)
     client.run(DISCORD_TOKEN)
-
-def request_refresh_and_wait(force: bool = True, timeout: float = 8.0) -> bool:
-    """Request a monitor refresh and wait for a fresh snapshot.
-    Can be called from any thread. Returns True if a fresh snapshot was seen within timeout.
-    """
-    try:
-        # Clear previous snapshot marker and request refresh
-        snapshot_updated.clear()
-        if force:
-            force_refresh_requested.set()
-        else:
-            refresh_requested.set()
-        # Wait for monitor thread to capture a fresh snapshot
-        return snapshot_updated.wait(timeout=timeout)
-    finally:
-        # Ensure we don't leave the request flag set if wait timed out or succeeded
-        refresh_requested.clear()
-        force_refresh_requested.clear()
