@@ -424,14 +424,9 @@ def _fmt_secs(secs: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 def _print_available(kind: str, kind_shop: Dict[str, Any]):
-    inv = (kind_shop or {}).get("inventory", [])
-    if PRINT_ONLY_AVAILABLE:
-        inv = [i for i in inv if int(i.get("currentStock", 0)) > 0]
-    if not inv:
-        _dprint(f"[RESTOCK] {kind}: (no items with stock > 0)")
-        return
-    items = ", ".join(f"{i['name']} (stock {i['currentStock']})" for i in inv)
-    _dprint(f"[RESTOCK] {kind}: {items}")
+    # Silent: do not print per-item stock lists to stdout anymore.
+    # Notifications are still sent to Discord via notify_restock.
+    return
 
 def _format_seconds_verbose(s):
     try:
@@ -683,7 +678,6 @@ def monitor_loop(notifier: DiscordNotifier):
                                 continue
                             if cur and cur.get('shops') and cur['shops'].get(k):
                                 _dprint(f"[LOCAL] Reporting {k} after fresh normalized state.")
-                                _print_available(k, cur['shops'].get(k, {}))
                                 notifier.notify_restock(k, cur['shops'].get(k, {}))
                                 # mark as handled locally
                                 pending_print_kinds.discard(k)
@@ -743,18 +737,15 @@ def monitor_loop(notifier: DiscordNotifier):
                             period = restock_timers.get(kind, {}).get('period', DEFAULT_PERIODS.get(kind, float(secs)))
                             restock_timers[kind] = {'secs': float(secs), 't0': now, 'period': float(period)}
 
-                    # Immediately print the normalized JSON (no snapshot storage)
-                    try:
-                        _dprint("[NORMALIZED] (welcome)\n" + json.dumps(cur, indent=2))
-                    except Exception:
-                        _dprint("[NORMALIZED] (welcome) captured")
+                    # Do not print the full normalized JSON to stdout (silenced)
 
-                    # If any kinds were marked pending, print and notify them now
+                    # If any kinds were marked pending, notify them now (no stdout prints)
                     if pending_print_kinds:
                         for kind in sorted(pending_print_kinds):
-                            _dprint(f"[WELCOME] Fresh normalized state received; printing {kind}.")
-                            _print_available(kind, cur['shops'].get(kind, {}))
-                            notifier.notify_restock(kind, cur['shops'].get(kind, {}))
+                            try:
+                                notifier.notify_restock(kind, cur['shops'].get(kind, {}))
+                            except Exception:
+                                pass
                         pending_print_kinds.clear()
                 return
 
@@ -788,18 +779,15 @@ def monitor_loop(notifier: DiscordNotifier):
                                     _dbg(f"{kind} period updated via server reset → {cur_secs}s")
 
                     last_normalized = cur
-                    # Immediately print the normalized JSON (no snapshot storage)
-                    try:
-                        _dprint("[NORMALIZED] (partial)\n" + json.dumps(cur, indent=2))
-                    except Exception:
-                        _dprint("[NORMALIZED] (partial) captured")
+                    # Do not print the full normalized JSON to stdout (silenced)
 
-                    # If any kinds were marked pending, print and notify them now
+                    # If any kinds were marked pending, notify them now (no stdout prints)
                     if pending_print_kinds:
                         for kind in sorted(pending_print_kinds):
-                            _dprint(f"[PARTIAL] Fresh normalized state received; printing {kind}.")
-                            _print_available(kind, cur['shops'].get(kind, {}))
-                            notifier.notify_restock(kind, cur['shops'].get(kind, {}))
+                            try:
+                                notifier.notify_restock(kind, cur['shops'].get(kind, {}))
+                            except Exception:
+                                pass
                         pending_print_kinds.clear()
 
         client.on('Network.webSocketFrameReceived', on_ws_frame)
