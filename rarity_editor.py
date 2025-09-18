@@ -162,21 +162,14 @@ HTML = '''<!doctype html>
       return out;
     }
 
-    document.getElementById('save').addEventListener('click', async ()=>{
-      const saveButton = document.getElementById('save');
-      saveButton.disabled = true;
+    document.getElementById('save').onclick = async ()=>{
       const obj = collect();
       try{
         const r = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj)});
         if(!r.ok) throw new Error('save failed');
         document.getElementById('msg').textContent='Saved'; document.getElementById('msg').style.color='green';
-        await load();
-      }catch(e){
-        document.getElementById('msg').textContent='Save failed'; document.getElementById('msg').style.color='red';
-      } finally {
-        saveButton.disabled = false;
-      }
-    });
+      }catch(e){ document.getElementById('msg').textContent='Save failed'; document.getElementById('msg').style.color='red'; }
+    };
 
     document.getElementById('download').onclick = ()=>{
       const blob = new Blob([JSON.stringify(collect(), null, 2)], {type:'application/json'});
