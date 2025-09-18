@@ -144,3 +144,5 @@ cython_debug/
 # Editor and OS files
 .vscode/
 .DS_Store
+
+guild_watchlist.json
