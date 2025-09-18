@@ -970,34 +970,25 @@ async def shop_watch_view(interaction: discord.Interaction):
     extra = f"\n...and {len(labels)-30} more" if len(labels) > 30 else ""
     await interaction.response.send_message(f"Watched items (**{len(labels)}**):\n{preview}{extra}", ephemeral=True)
 
-# ---------- Events ----------
-@client.event
-async def on_ready():
-    global monitor_thread
-    _dprint(f"[DISCORD] Logged in as {client.user} (id={client.user.id})")
-    # Load and report saved watchlist counts for visibility
-    try:
-        wl = load_watchlist()
-        total_guilds = len(wl)
-        total_items = sum(len(v) for v in wl.values())
-        _dprint(f"[WATCHLIST] Loaded watchlist for {total_guilds} guild(s), {total_items} total selections.")
-    except Exception:
-        pass
-    # Start monitor thread once
-    if monitor_thread is None or not monitor_thread.is_alive():
-        monitor_thread = threading.Thread(target=monitor_loop, args=(notifier,), daemon=True)
-        monitor_thread.start()
-
-    # Sync slash commands to each guild for fast availability
-    try:
-        for g in client.guilds:
-            await tree.sync(guild=g)
-        # Also do a global sync (optional, slower to propagate)
-        await tree.sync()
-        _dprint(f"[DISCORD] Slash commands synced to {len(client.guilds)} guild(s) + global.")
-    except Exception as e:
-        _dprint(f"[WARN] command sync failed: {e}")
-
+# ---------- Help command (slash) ----------
+@tree.command(name="help", description="Show available commands and brief usage.")
+async def help_command(interaction: discord.Interaction):
+    help_lines = [
+        "Available commands:",
+        "Slash commands:",
+        "  /shop_watch — Configure which items this server will be notified about (ephemeral UI).",
+        "  /shop_watch_view — Show the current watchlist for this server (ephemeral).",
+        "  /help — Show this help message.",
+        "Message commands (prefix):",
+        "  !in_stock — List all items currently in stock.",
+        "  !shop_debug — Show internal timer/debug info (admins/developers).",
+        "  !shop_snapshot — (disabled) previously wrote a snapshot to disk.",
+        "  !help — Show this help message.",
+        "Watchlist notes:",
+        "  Use /shop_watch to open the ephemeral checklist UI. Selections are saved per-server in guild_watchlist.json.",
+    ]
+    msg = "\n".join(help_lines)
+    await interaction.response.send_message(msg, ephemeral=True)
 
 # Optional message commands you already had
 @client.event
@@ -1045,17 +1036,43 @@ async def on_message(message: discord.Message):
             if not inv:
                 continue
             total += len(inv)
-            items_str = ", ".join(f"{_pretty_label_for_name(i.get('name'))} (x{int(i.get('currentStock', 0))})" for i in inv)
-            parts.append(f"**{kind.title()}**: {items_str}")
+            # Build a multi-line list: one item per line
+            item_lines = []
+            for i in inv:
+                label = _pretty_label_for_name(i.get('name'))
+                count = int(i.get('currentStock', 0))
+                item_lines.append(f"- {label} (x{count})")
+            items_str = "\n".join(item_lines)
+            parts.append(f"**{kind.title()}**:\n{items_str}")
 
         if not parts:
             await message.channel.send("No items are currently in stock.")
             return
 
-        msg = f"Items in stock ({total}):\n" + "\n".join(parts)
+        msg = f"Items in stock ({total}):\n" + "\n\n".join(parts)
         if len(msg) > 1900:
             msg = msg[:1900] + '\n...truncated'
         await message.channel.send(msg)
+
+    elif cmd == '!help':
+        help_text = (
+            "Available commands:\n"
+            "Slash commands:\n"
+            "  /shop_watch — Configure which items this server will be notified about (ephemeral UI).\n"
+            "  /shop_watch_view — Show the current watchlist for this server (ephemeral).\n"
+            "  /help — Show this help message.\n"
+            "Message commands (prefix):\n"
+            "  !in_stock — List all items currently in stock.\n"
+            "  !shop_debug — Show internal timer/debug info.\n"
+            "  !shop_snapshot — (disabled) previously wrote a snapshot to disk.\n"
+            "  !help — Show this help message.\n"
+            "Watchlist notes:\n"
+            "  Use /shop_watch to open the ephemeral checklist UI. Selections are saved per-server in guild_watchlist.json."
+        )
+        try:
+            await message.channel.send(help_text)
+        except Exception:
+            pass
 
 # ---------- Run ----------
 if __name__ == '__main__':
