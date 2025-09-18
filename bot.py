@@ -1,1512 +1,1033 @@
-import os
-import io
+#!/usr/bin/env python3
+"""
+Discord-integrated Magic Garden shop monitor + watchlist UI.
+
+Additions:
+- /shop_watch: ephemeral multi-page checklist to choose watched items (labels "Name — Rarity")
+- /shop_watch_view: view current watched items for this guild
+- Per-guild watchlist stored in guild_watchlist.json
+- Restock notifications filtered by watchlist (if non-empty)
+
+Env (.env) variables:
+  DISCORD_TOKEN (required)
+  MAGIC_ROOM_URL, SHOP_SNAPSHOT_PATH (optional path used only if WRITE_SNAPSHOT=1)
+  SEED_PERIOD_SEC, EGG_PERIOD_SEC, TOOL_PERIOD_SEC, DECOR_PERIOD_SEC (optional overrides)
+  DEBUG=1 (optional; more verbose logging)
+  WRITE_SNAPSHOT=1 (optional; default 0 → disable file writes)
+  SNAPSHOT_LOG=1   (optional; default 0 → suppress "Wrote ..." logs)
+"""
+
+import os, io, json, time, threading, re
+from typing import Any, Dict, List, Optional, Set, Tuple
 from pathlib import Path
-from typing import Optional, Dict, Any
-import asyncio
-import re
-import argparse
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import json
-import time
+from collections import defaultdict
 
-# If you installed Playwright browsers in a local cache, prefer that before importing Playwright
-os.environ.setdefault(
-    "PLAYWRIGHT_BROWSERS_PATH",
-    str(Path(__file__).resolve().parent / ".playwright-cache"),
-)
-
-import discord
-from discord.ext import commands
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
+import discord
+from discord import app_commands
 
-load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CDP_DEFAULT = os.getenv("CDP_DEFAULT", "http://127.0.0.1:9222")
+# ---------- Load env ----------
+ROOT = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=ROOT / '.env')
 
-# Parse command-line arguments (optional periodic start time HH:MM:SS or 12-hour like 9:10:30pm)
-parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument('--periodic-start', type=str, default=None,
-                    help='Optional time of day to auto-start periodic checks, format HH:MM[:SS] (24h) or h[:mm[:ss]]am/pm e.g. 9:10pm or 9:10:30pm')
-# parse known args so this won't interfere when invoked by other tooling
-_args, _unknown = parser.parse_known_args()
-PERIODIC_START_STR = _args.periodic_start
-PERIODIC_START_TIME = None
-if PERIODIC_START_STR:
-    s = PERIODIC_START_STR.strip().lower()
-    # Accept formats like '9:10:30pm', '9:10 pm', '09:10:30', '21:10:30', '9pm', '9:05am', '9:05:07am'
-    import re
-    # groups: 1=hour, 2=minute (optional), 3=second (optional), 4=am/pm (optional)
-    m = re.match(r"^\s*(\d{1,2})(?::(\d{2})(?::(\d{2}))?)?\s*(am|pm)?\s*$", s)
-    if m:
-        hh = int(m.group(1))
-        mm = int(m.group(2) or 0)
-        ss = int(m.group(3) or 0)
-        ampm = m.group(4)
-        if ampm:
-            # 12-hour -> 24-hour conversion
-            if hh == 12 and ampm == 'am':
-                hh = 0
-            elif hh != 12 and ampm == 'pm':
-                hh = hh + 12
-        # If no am/pm provided, assume 24-hour input; validate ranges
-        if 0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60:
-            PERIODIC_START_TIME = (hh, mm, ss)
-    else:
-        PERIODIC_START_TIME = None
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+ROOM_URL = os.getenv('MAGIC_ROOM_URL', 'https://magiccircle.gg/r/LDQK')
+OUT_PATH = os.getenv('SHOP_SNAPSHOT_PATH', str(ROOT / 'shop_snapshot.json'))
+DEBUG = os.getenv('DEBUG', '0') == '1'
 
-# Remove RESTOCK_TRIGGER_TIME env usage; disable the exact timer-trigger unless set elsewhere
-TRIGGER_MIN = None
-TRIGGER_SEC = None
+# Disable file writes by default; can enable via WRITE_SNAPSHOT=1
+WRITE_SNAPSHOT = os.getenv('WRITE_SNAPSHOT', '0') == '1'
+SNAPSHOT_LOG   = os.getenv('SNAPSHOT_LOG', '0') == '1'
 
-# Path for persistent per-guild settings
-GUILD_SETTINGS_PATH = Path(__file__).resolve().parent / "guild_settings.json"
-# In-memory cache of guild settings loaded from disk
-GUILD_SETTINGS: Dict[str, Dict[str, Any]] = {}
-
-def _load_guild_settings() -> None:
-    """Load guild settings from JSON on startup (silently ignore missing/invalid file)."""
-    global GUILD_SETTINGS
-    try:
-        if GUILD_SETTINGS_PATH.exists():
-            with open(GUILD_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                GUILD_SETTINGS = json.load(f)
-                # ensure string keys
-                GUILD_SETTINGS = {str(k): dict(v or {}) for k, v in GUILD_SETTINGS.items()}
-        else:
-            GUILD_SETTINGS = {}
-    except Exception:
-        GUILD_SETTINGS = {}
-
-def _save_guild_settings() -> None:
-    """Persist current guild settings to disk (best-effort)."""
-    try:
-        with open(GUILD_SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(GUILD_SETTINGS, f, indent=2, sort_keys=True)
-    except Exception:
-        pass
-
-def _get_guild_config_for(guild_id: int) -> Dict[str, Any]:
-    """Return the effective per-guild config dict with defaults applied."""
-    g = GUILD_SETTINGS.get(str(guild_id), {})
-    return {
-        # Do NOT fall back to the old global RARITY_THRESHOLD_NAME here — prefer per-guild config.
-        'rarity': g.get('rarity', None),
-        'plant': g.get('plant', None),
-        'notify_on_new_only': g.get('notify_on_new_only', NOTIFY_ON_NEW_ONLY),
-        'channel_id': g.get('channel_id', None),
-    }
-
-# Load settings at module import
-_load_guild_settings()
-
-# Minimal bot that attaches to an external headless Chromium and returns the current page HTML
-class SimpleCDPBot(commands.Bot):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.playwright = None
-        # Previously cdp_browser for connect_over_cdp; now we launch our own browser
-        self.browser = None
-        self.cdp_pages = []
-
-    async def setup_hook(self):
-        # Do not launch an internal browser. The bot will connect to an external browser over CDP
-        # when needed via _ensure_attached. This keeps the browser independent and manual.
-        self.playwright = None
-        self.browser = None
-        self.cdp_pages = []
-
-    async def close(self):
-        # On close, stop any local Playwright client state but do not attempt to launch/close
-        # an external browser that the user manages.
-        try:
-            if getattr(self, 'playwright', None):
-                try:
-                    await self.playwright.stop()
-                except Exception:
-                    pass
-        finally:
-            await super().close()
-
-intents = discord.Intents.default()
-intents.message_content = True
-# Disable the default built-in help command so we can register our own custom !help
-bot = SimpleCDPBot(command_prefix="!", intents=intents, help_command=None)
-
-# Track which pages we've already notified to avoid duplicate alerts
-_last_restock_notified = {}
-# New: per-page timer notification dedupe
-_last_timer_notified = {}
-# New: per-page set of names already notified for rarity-threshold scans
-_last_threshold_notified = {}
-
-RARITY_PRIORITY = {
-    'common': 0,
-    'uncommon': 1,
-    'rare': 2,
-    'epic': 3,
-    'legendary': 4,
-    'mythic': 5,
-    'divine': 6,
-    'celestial': 7,
+DEFAULT_PERIODS = {
+    "seed":  int(os.getenv("SEED_PERIOD_SEC",  300)),   # 5 min
+    "egg":   int(os.getenv("EGG_PERIOD_SEC",   600)),   # 10 min
+    "tool":  int(os.getenv("TOOL_PERIOD_SEC",  300)),   # 5 min
+    "decor": int(os.getenv("DECOR_PERIOD_SEC", 3000)),  # 50 min
 }
 
-# Rarity threshold configuration
-# - Default is read from RESTOCK_RARITY_THRESHOLD env var (e.g. "mythic").
-# - Can be changed at runtime via set_rarity_threshold() or the !set_threshold command (bot owner only).
-RARITY_THRESHOLD_NAME = os.getenv("RESTOCK_RARITY_THRESHOLD", "mythic").lower()
-RARITY_THRESHOLD_VALUE = RARITY_PRIORITY.get(RARITY_THRESHOLD_NAME, max(RARITY_PRIORITY.values()))
+PRINT_ONLY_AVAILABLE = True
+LOCAL_SOFT_RESET_AT_ZERO = True
+MAX_WAIT_SEC = 60
+MIN_REFRESH_COOLDOWN_SEC = 8.0
 
-# Default periodic check interval (change this value in code to adjust how often the threshold checker runs)
-# Value is in seconds. Default = 5 minutes.
-PERIODIC_INTERVAL_SECONDS = 300
+# ---------- State (shared across threads; guard with state_lock) ----------
+state_lock = threading.Lock()
+written_first_snapshot = threading.Event()
+snapshot_updated = threading.Event()
 
-# Control dedupe behavior for automatic notifications:
-# - If True, notify ONLY when new threshold-passing item names appear (previous behavior).
-# - If False, notify every scan as long as threshold-passing items are present.
-NOTIFY_ON_NEW_ONLY = False
+full_state: Dict[str, Any] = {}
+last_normalized: Optional[Dict[str, Any]] = None
 
-# Plant-based threshold (if set, use the rarity of this plant as the threshold)
-PLANT_THRESHOLD_NAME = None
+# Countdown state per kind:
+#   secs: current server baseline
+#   t0: baseline monotonic()
+#   period: stable period for local reset at zero
+restock_timers: Dict[str, Dict[str, float]] = {}
 
-# Print configured threshold on startup for visibility
-print(f"Restock rarity threshold: {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
+# Refresh orchestration (performed on the monitor thread)
+refresh_requested = threading.Event()
+force_refresh_requested = threading.Event()
+last_refresh_at = 0.0  # guarded by state_lock
+pending_print_kinds: Set[str] = set()  # guarded by state_lock
 
-# Canonical full ordering of items (lowest -> highest). Use this for position-based plant thresholds.
-FULL_ORDER = [
-    "Carrot Seed",
-    "Strawberry Seed",
-    "Aloe Seed",
-    "Blueberry Seed",
-    "Apple Seed",
-    "Tulip Seed",
-    "Tomato Seed",
-    "Daffodil Seed",
-    "Corn Kernel",
-    "Watermelon Seed",
-    "Pumpkin Seed",
-    "Echeveria Cutting",
-    "Coconut Seed",
-    "Banana Seed",
-    "Lily Seed",
-    "Burro's Tail Cutting",
-    "Mushroom Spore",
-    "Cactus Seed",
-    "Bamboo Seed",
-    "Grape Seed",
-    "Pepper Seed",
-    "Lemon Seed",
-    "Passion Fruit Seed",
-    "Dragon Fruit Seed",
-    "Lychee Pit",
-    "Sunflower Seed",
-    "Starweaver Pod",
-]
+# In-memory snapshot buffer
+last_snapshot_bytes: bytes = b""
 
-# Friendly rarity labels for known items (used by list_plants and for logging)
-RARITY_MAP = {
-    "Carrot Seed": "Common",
-    "Strawberry Seed": "Common",
-    "Aloe Seed": "Common",
-    "Blueberry Seed": "Uncommon",
-    "Apple Seed": "Uncommon",
-    "Tulip Seed": "Uncommon",
-    "Tomato Seed": "Uncommon",
-    "Daffodil Seed": "Rare",
-    "Corn Kernel": "Rare",
-    "Watermelon Seed": "Rare",
-    "Pumpkin Seed": "Rare",
-    "Echeveria Cutting": "Legendary",
-    "Coconut Seed": "Legendary",
-    "Banana Seed": "Legendary",
-    "Lily Seed": "Legendary",
-    "Burro's Tail Cutting": "Legendary",
-    "Mushroom Spore": "Mythical",
-    "Cactus Seed": "Mythical",
-    "Bamboo Seed": "Mythical",
-    "Grape Seed": "Mythical",
-    "Pepper Seed": "Divine",
-    "Lemon Seed": "Divine",
-    "Passion Fruit Seed": "Divine",
-    "Dragon Fruit Seed": "Divine",
-    "Lychee Pit": "Divine",
-    "Sunflower Seed": "Divine",
-    "Starweaver Pod": "Celestial",
+# ---------- Files ----------
+GUILD_SETTINGS_PATH = ROOT / 'guild_settings.json'        # existing general config (optional)
+ITEM_RARITIES_PATH  = ROOT / 'item_rarities.json'
+WATCHLIST_PATH      = ROOT / 'guild_watchlist.json'       # NEW: where selections live
+
+# ---------- Utilities ----------
+def _dprint(msg: str):
+    print(msg, flush=True)
+
+def _dbg(msg: str):
+    if DEBUG:
+        _dprint(f"[DEBUG] {msg}")
+
+def _norm_item_key(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+
+# ---------- Load item rarities (for labels) ----------
+VOCAB: Dict[str, str] = {
+  "carrot seed": "common",
+  "strawberry seed": "common",
+  "aloe seed": "common",
+  "blueberry seed": "uncommon",
+  "apple seed": "uncommon",
+  "tulip seed": "uncommon",
+  "tomato seed": "uncommon",
+  "daffodil seed": "uncommon",
+  "corn kernel": "rare",
+  "watermelon seed": "rare",
+  "pumpkin seed": "rare",
+  "echeveria cutting": "legendary",
+  "coconut seed": "legendary",
+  "banana seed": "legendary",
+  "lily seed": "legendary",
+  "burro's tail cutting": "legendary",
+  "mushroom spore": "mythic",
+  "cactus seed": "mythic",
+  "bamboo seed": "mythic",
+  "grape seed": "mythic",
+  "pepper seed": "divine",
+  "lemon seed": "divine",
+  "passion fruit seed": "divine",
+  "dragon fruit seed": "divine",
+  "lychee pit": "divine",
+  "sunflower seed": "divine",
+  "starweaver pod": "celestial",
+  "common egg": "common",
+  "uncommon egg": "uncommon",
+  "rare egg": "rare",
+  "legendary egg": "legendary",
+  "mythical egg": "mythic",
+  "watering can": "common",
+  "planter pot": "common",
+  "shovel": "uncommon",
+  "small rock": "common",
+  "medium rock": "common",
+  "large rock": "common",
+  "wood bench": "common",
+  "wood arch": "common",
+  "wood bridge": "common",
+  "wood lamp post": "common",
+  "wood owl": "common",
+  "stone bench": "uncommon",
+  "stone arch": "uncommon",
+  "stone bridge": "uncommon",
+  "stone lamp post": "uncommon",
+  "stone gnome": "uncommon",
+  "marble bench": "rare",
+  "marble arch": "rare",
+  "marble bridge": "rare",
+  "marble lamp post": "rare"
 }
+ITEM_RARITIES: Dict[str, str] = {k.lower(): v.lower() for k, v in VOCAB.items()}
 
-def set_rarity_threshold(name: str) -> bool:
-    """Set the runtime rarity threshold. Returns True if accepted."""
-    global RARITY_THRESHOLD_NAME, RARITY_THRESHOLD_VALUE
+def _sk(x: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (x or "").lower())
+
+def _base(x: str) -> str:
+    x = (x or "").strip().lower()
+    for suf in (" seed", " seeds", " kernel", " cutting", " cuttings", " pod", " pods", " spore", " pit"):
+        if x.endswith(suf):
+            x = x[: -len(suf)]
+            break
+    return _sk(x)
+
+CANON_MAP: Dict[str, str] = {}
+for _k in ITEM_RARITIES.keys():
+    CANON_MAP[_sk(_k)] = _k
+    CANON_MAP[_base(_k)] = _k
+
+def _canonical_vocab_key(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    for cand in {_sk(name), _base(name)}:
+        if cand in CANON_MAP:
+            return CANON_MAP[cand]
+    return None
+
+def _pretty_label_for_name(name: Optional[str]) -> str:
+    ck = _canonical_vocab_key(name)
+    if ck:
+        r = ITEM_RARITIES.get(ck, "")
+        return f"{ck.title()} — {r.capitalize()}" if r else ck.title()
+    return name or "unknown"
+
+RARITY_ORDER = {
+    'celestial': 0,
+    'divine': 1,
+    'mythic': 2,
+    'legendary': 3,
+    'rare': 4,
+    'uncommon': 5,
+    'common': 6,
+}
+def _rarity_for_name(name: Optional[str]) -> str:
+    if not name:
+        return ''
+    try:
+        return (ITEM_RARITIES.get(_norm_item_key(name)) or '').capitalize()
+    except Exception:
+        return ''
+
+# Build options list from item_rarities: (label, value, rarity)
+def _kind_for_name(name: str) -> str:
     n = (name or "").lower()
-    if n in RARITY_PRIORITY:
-        RARITY_THRESHOLD_NAME = n
-        RARITY_THRESHOLD_VALUE = RARITY_PRIORITY[n]
-        return True
-    return False
+    if "egg" in n:
+        return "egg"
+    tools = {"watering can", "planter pot", "shovel"}
+    if any(t in n for t in tools):
+        return "tool"
+    decor_kws = ("bench", "arch", "bridge", "lamp", "gnome", "rock", "owl")
+    if any(k in n for k in decor_kws):
+        return "decor"
+    return "seed"
 
-@bot.command(name="set_server_threshold")
-@commands.has_permissions(administrator=True)
-async def cmd_set_server_threshold(ctx, rarity: str):
-    """Server administrators: set this server's rarity threshold. Example: !set_server_threshold divine"""
-    if not ctx.guild:
-        await ctx.send("This command must be used inside a server/guild channel.")
-        return
-    n = (rarity or "").lower()
-    if n not in RARITY_PRIORITY:
-        await ctx.send(f"Unknown rarity '{rarity}'. Valid options: {', '.join(RARITY_PRIORITY.keys())}")
-        return
-    gid = str(ctx.guild.id)
-    cfg = GUILD_SETTINGS.get(gid, {})
-    cfg['rarity'] = n
-    GUILD_SETTINGS[gid] = cfg
-    _save_guild_settings()
-    await ctx.send(f"This server's rarity threshold set to {n}.")
+def _build_item_options() -> List[Tuple[str,str,str]]:
+    opts = []
+    for raw_name, rarity in ITEM_RARITIES.items():
+        name = raw_name.strip()
+        r = str(rarity).strip().lower()
+        label = f"{name.title()} — {r.capitalize()}" if r else name.title()
+        opts.append((label, _norm_item_key(name), r))
+    # Keep the exact order from item_rarities.json (do not sort)
+    return opts
 
-@bot.command(name="set_server_plant")
-@commands.has_permissions(administrator=True)
-async def cmd_set_server_plant(ctx, *, plant: str = None):
-    """Server administrators: set a plant name to use as this server's threshold. Example: !set_server_plant "Mushroom Spore""" 
-    if not ctx.guild:
-        await ctx.send("This command must be used inside a server/guild channel.")
-        return
-    if not plant:
-        await ctx.send("Usage: !set_server_plant <plant name>\nExample: !set_server_plant Mushroom Spore")
-        return
-    gid = str(ctx.guild.id)
-    cfg = GUILD_SETTINGS.get(gid, {})
-    cfg['plant'] = plant.strip()
-    GUILD_SETTINGS[gid] = cfg
-    _save_guild_settings()
-    await ctx.send(f"This server's plant-based threshold set to '{plant.strip()}'.")
+ITEM_OPTIONS = _build_item_options()
 
-@bot.command(name="clear_server_plant")
-@commands.has_permissions(administrator=True)
-async def cmd_clear_server_plant(ctx):
-    """Server administrators: clear this server's plant-based threshold so the server uses the rarity threshold instead."""
-    if not ctx.guild:
-        await ctx.send("This command must be used inside a server/guild channel.")
-        return
-    gid = str(ctx.guild.id)
-    cfg = GUILD_SETTINGS.get(gid, {})
-    cfg.pop('plant', None)
-    GUILD_SETTINGS[gid] = cfg
-    _save_guild_settings()
-    await ctx.send("Cleared this server's plant-based threshold; using rarity threshold again.")
+# Paginate items in the exact order they appear (no grouping by kind) so dropdown pages preserve JSON order
+def _build_pages_by_kind(page_size: int = 25):
+    pages = []
+    total = len(ITEM_OPTIONS)
+    if total == 0:
+        return pages
+    kind_total = (total + page_size - 1) // page_size
+    for i in range(0, total, page_size):
+        page_items = ITEM_OPTIONS[i:i+page_size]
+        pages.append({'kind': 'all', 'items': page_items, 'kind_page': i//page_size + 1, 'kind_total': kind_total})
+    return pages
 
-@bot.command(name="set_server_notify_new_only")
-@commands.has_permissions(administrator=True)
-async def cmd_set_server_notify_new_only(ctx, flag: str = 'true'):
-    """Server administrators: toggle whether this server only receives notifications for new items (true/false)."""
-    if not ctx.guild:
-        await ctx.send("This command must be used inside a server/guild channel.")
-        return
-    val = flag.strip().lower() in ('1','true','yes','y')
-    gid = str(ctx.guild.id)
-    cfg = GUILD_SETTINGS.get(gid, {})
-    cfg['notify_on_new_only'] = val
-    GUILD_SETTINGS[gid] = cfg
-    _save_guild_settings()
-    await ctx.send(f"This server's notify_on_new_only set to {val}.")
+ITEM_PAGES = _build_pages_by_kind()
 
-@bot.command(name="set_server_channel")
-@commands.has_permissions(administrator=True)
-async def cmd_set_server_channel(ctx, channel_id: Optional[int] = None):
-    """Server administrators: set a channel ID where notifications will be sent for this server. If omitted, the bot falls back to the first writable text channel."""
-    if not ctx.guild:
-        await ctx.send("This command must be used inside a server/guild channel.")
-        return
-    gid = str(ctx.guild.id)
-    cfg = GUILD_SETTINGS.get(gid, {})
-    if channel_id is None:
-        cfg.pop('channel_id', None)
-        GUILD_SETTINGS[gid] = cfg
-        _save_guild_settings()
-        await ctx.send("Cleared configured channel; the bot will use the first writable text channel instead.")
-        return
-    cfg['channel_id'] = int(channel_id)
-    GUILD_SETTINGS[gid] = cfg
-    _save_guild_settings()
-    await ctx.send(f"This server's notification channel set to {channel_id}.")
-
-@bot.command(name="show_server_settings")
-@commands.has_permissions(administrator=True)
-async def cmd_show_server_settings(ctx):
-    """Show the current server-specific configuration (if any)."""
-    if not ctx.guild:
-        await ctx.send("This command must be used inside a server/guild channel.")
-        return
-    cfg = _get_guild_config_for(ctx.guild.id)
-    lines = [f"Server settings for {ctx.guild.name} (id {ctx.guild.id}):"]
-    rarity_val = cfg.get('rarity') if cfg.get('rarity') is not None else 'not configured'
-    lines.append(f"- rarity: {rarity_val}")
-    lines.append(f"- plant: {cfg.get('plant')}")
-    lines.append(f"- notify_on_new_only: {cfg.get('notify_on_new_only')}")
-    lines.append(f"- channel_id: {cfg.get('channel_id')}")
-    await ctx.send("\n".join(lines))
-
-@bot.command(name="set_plant_threshold")
-@commands.is_owner()
-async def cmd_set_plant_threshold(ctx, *, plant: str = None):
-    """Owner-only: set a plant name whose rarity will be used as the notification threshold.
-    Example: !set_plant_threshold "Mushroom Spore" -> use the rarity of Mushroom Spore as the threshold.
-    """
-    global PLANT_THRESHOLD_NAME
-    if not plant:
-        await ctx.send("Usage: !set_plant_threshold <plant name>\nExample: !set_plant_threshold Mushroom Spore")
-        return
-    PLANT_THRESHOLD_NAME = plant.strip()
-    await ctx.send(f"Plant threshold set to '{PLANT_THRESHOLD_NAME}'. The bot will use that plant's rarity as the filter when it can find the plant on a page.")
-
-@bot.command(name="clear_plant_threshold")
-@commands.is_owner()
-async def cmd_clear_plant_threshold(ctx):
-    """Owner-only: clear any plant-based threshold so the bot uses the rarity threshold instead."""
-    global PLANT_THRESHOLD_NAME
-    PLANT_THRESHOLD_NAME = None
-    await ctx.send("Cleared plant-based threshold; using rarity threshold again.")
-
-@bot.command(name="help")
-async def cmd_help(ctx):
-    """Show available commands and basic usage."""
-    embed = discord.Embed(title="Magic Garden Checker — Commands", color=0x3498db)
-    embed.description = (
-        "Quick reference for available commands. Commands marked (owner) require the bot owner; server-admin commands require Administrator permissions."
-    )
-
-    quick_start = (
-        "• The bot connects to an external Chromium instance over CDP (CDP_DEFAULT).\n"
-        "• Start the browser and open the shop page(s) you want the bot to inspect.\n"
-        "• Use `!set_server_channel <channel_id>` to pin notifications to a specific channel (recommended).\n"
-        "• Optionally schedule automatic periodic checks with `--periodic-start HH:MM[:SS]` when launching the bot."
-    )
-
-    owner_cmds_lines = [
-        "`!start_periodic_check [minutes]` — Start periodic scans (owner only).",
-        "`!stop_periodic_check` — Stop the periodic scanner (owner only).",
-        "`!run_seed_check` — Run an immediate one-off scan (owner only).",
-        "`!set_plant_threshold <plant name>` — Use the specified plant's rarity as the global threshold (owner only).",
-        "`!clear_plant_threshold` — Clear the global plant-based threshold (owner only).",
-    ]
-
-    admin_cmds_lines = [
-        "`!set_server_threshold <rarity>` — Set this server's rarity threshold (administrator).",
-        "`!set_server_plant <plant name>` — Use a specific plant on pages as this server's threshold (administrator).",
-        "`!clear_server_plant` — Clear the server's plant-based threshold (administrator).",
-        "`!set_server_notify_new_only <true|false>` — Send notifications only for newly seen items (administrator).",
-        "`!set_server_channel <channel_id>` — Configure which channel this server receives notifications in (administrator).",
-        "`!show_server_settings` — Display this server's current configuration (administrator).",
-    ]
-
-    utility_cmds_lines = [
-        "`!check_threshold [index] [endpoint] [\"Plant Name\"]` — Show configured thresholds and optionally inspect a plant on a tab.",
-        "`!current_html [index] [endpoint]` — Return page HTML for debugging.",
-        "`!screenshot [index] [full] [endpoint]` — Capture a screenshot; use `true` for full-page.",
-        "`!in_stock [index] [endpoint]` — List items detected as in-stock on the selected tab.",
-        "`!list_plants` — Fetch current plant/item names from the open page (useful for `!set_plant_threshold`).",
-        "`!help` — Show this help message.",
-    ]
-
-    embed.add_field(name="Quick start", value=quick_start, inline=False)
-    embed.add_field(name="Owner-only commands", value="\n".join(owner_cmds_lines), inline=False)
-    embed.add_field(name="Server administrator commands", value="\n".join(admin_cmds_lines), inline=False)
-    embed.add_field(name="Utility commands", value="\n".join(utility_cmds_lines), inline=False)
-
-    notes = (
-        "Notes:\n"
-        "• If a server has neither a rarity nor plant threshold configured, it will not receive automatic notifications.\n"
-        "• Plant thresholds are matched against names discovered on the page; use `!list_plants` to obtain exact names.\n"
-        "• The bot attaches to an external browser — ensure the browser is running and accessible at the CDP endpoint."
-    )
-    embed.add_field(name="Notes", value=notes, inline=False)
-
-    await ctx.send(embed=embed)
-
-@bot.command(name="check_threshold")
-async def check_threshold(ctx, index: Optional[int] = None, endpoint: Optional[str] = None, *, plant: Optional[str] = None):
-    """Show current threshold configuration. If attached to a page, optionally check a plant name on the page.
-
-    Usage:
-      !check_threshold                     -> show configured thresholds
-      !check_threshold 0                   -> show thresholds and inspect tab 0
-      !check_threshold 0 http://... "Plant Name"  -> inspect plant on tab 0 (plant name may contain spaces)
-    """
-    endpoint = endpoint or CDP_DEFAULT
-
-    # Prefer per-guild settings when invoked from inside a guild; otherwise show global defaults.
-    guild_cfg = None
-    if ctx.guild:
-        guild_cfg = _get_guild_config_for(ctx.guild.id)
-
-    lines = []
-    if guild_cfg:
-        # show whether this server has a configured rarity threshold
-        if guild_cfg.get('rarity') is not None:
-            lines.append(f"Server rarity threshold: {guild_cfg.get('rarity')} ({RARITY_PRIORITY.get(guild_cfg.get('rarity'), RARITY_THRESHOLD_VALUE)})")
-        else:
-            lines.append("Server rarity threshold: not configured")
-        if guild_cfg.get('plant'):
-            lines.append(f"Server plant-based threshold configured: '{guild_cfg.get('plant')}'")
-        else:
-            lines.append("Server plant-based threshold: not configured")
-        lines.append(f"Server notify_on_new_only: {guild_cfg.get('notify_on_new_only')}")
-        if guild_cfg.get('channel_id'):
-            lines.append(f"Server configured channel_id: {guild_cfg.get('channel_id')}")
-    else:
-        lines.append(f"Global rarity threshold: {RARITY_THRESHOLD_NAME} ({RARITY_THRESHOLD_VALUE})")
-        if PLANT_THRESHOLD_NAME:
-            lines.append(f"Global plant-based threshold configured: '{PLANT_THRESHOLD_NAME}'")
-        else:
-            lines.append("Global plant-based threshold: not configured")
-        lines.append(f"Global notify_on_new_only: {NOTIFY_ON_NEW_ONLY}")
-
-    # If user only wanted configuration, and no page inspection requested, send short reply
-    if plant is None and index is None:
-        await ctx.send("\n".join(lines))
-        return
-
-    # When inspecting a page, use guild-specific plant if present, otherwise the global PLANT_THRESHOLD_NAME
-    effective_plant_threshold = None
-    if guild_cfg and guild_cfg.get('plant'):
-        effective_plant_threshold = guild_cfg.get('plant')
-    else:
-        effective_plant_threshold = PLANT_THRESHOLD_NAME
-
-    # Use guild-specific rarity threshold value for comparisons when invoked from a guild
-    effective_global_threshold_value = RARITY_THRESHOLD_VALUE
-    if guild_cfg:
-        effective_global_threshold_value = RARITY_PRIORITY.get(guild_cfg.get('rarity', RARITY_THRESHOLD_NAME), RARITY_THRESHOLD_VALUE)
-
-    # Try to attach to a browser to inspect the page and plant if requested
-    attached = await _ensure_attached(endpoint)
-    if not attached:
-        await ctx.send("\n".join(lines) + f"\nNote: Failed to attach to CDP endpoint: {endpoint}")
-        return
-
-    pages = await _get_pages()
-    if not pages:
-        await ctx.send("\n".join(lines) + "\nNote: No open pages found in the attached browser.")
-        return
-
-    sel = 0 if index is None else int(index)
-    if sel < 0 or sel >= len(pages):
-        await ctx.send(f"Invalid index {sel}. Must be between 0 and {len(pages)-1}.")
-        return
-
-    page = pages[sel]
+# ---------- Watchlist storage ----------
+def load_watchlist() -> Dict[str, List[str]]:
     try:
-        # Scrape items with heuristic rarity from the page (same heuristics used elsewhere)
-        items = await page.evaluate(r"""
-            () => {
-                const out = [];
-                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
-                for (const card of cards) {
-                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
-                    const itemName = (nameEl && (nameEl.textContent || '').trim()) || '';
-                    if (!itemName) continue;
-                    const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
-                    let rarity = 'common';
-                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
-                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
-                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
-                    else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
-                    else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
-                    else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
-                    else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
-                    out.push({name: itemName, rarity});
-                }
-                // Deduplicate preserving first-seen order
-                const seen = new Set();
-                return out.filter(it => {
-                    if (seen.has(it.name)) return false;
-                    seen.add(it.name);
-                    return true;
-                });
-            }
-        """)
-
-        if not items:
-            await ctx.send("No item names were found on the page.")
-            return
-
-        # Build name->rarity map for quick lookup
-        heur = {it.get('name'): it.get('rarity') for it in items}
-
-        # If a specific plant name was requested, try to find it on the page
-        if plant:
-            pname = plant.strip().lower()
-            matched = None
-            for it in items:
-                iname = (it.get('name') or '').lower()
-                if iname == pname or pname in iname:
-                    matched = it
-                    break
-
-            if not matched:
-                lines.append(f"Plant '{plant}' not found on the selected page (tab {sel}).")
-                await ctx.send("\n".join(lines))
-                return
-
-            name = matched.get('name')
-            rarity = matched.get('rarity')
-            lines.append(f"Found plant on page: {name} — rarity: {rarity}")
-
-            # Canonical position info if available
-            if name in FULL_ORDER:
-                idx = FULL_ORDER.index(name)
-                lines.append(f"Position in canonical FULL_ORDER: {idx} (0 = lowest rarity -> higher index = rarer)")
-            else:
-                lines.append("Plant not present in canonical FULL_ORDER; position-based comparisons unavailable.")
-
-            # Determine whether this plant would meet the effective threshold
-            # Compute effective threshold according to current configuration and presence of a plant-based threshold
-            effective_threshold_value = effective_global_threshold_value
-            threshold_source = f"rarity >= {guild_cfg.get('rarity') if guild_cfg else RARITY_THRESHOLD_NAME}"
-            # If a plant-based threshold is configured, attempt to locate that plant on the same page
-            position_mode = False
-            plant_idx = None
-            plant_rarity = None
-            if effective_plant_threshold:
-                pname_cfg = effective_plant_threshold.strip().lower()
-                matched_cfg = None
-                for it in items:
-                    if (it.get('name') or '').lower() == pname_cfg or pname_cfg in (it.get('name') or '').lower():
-                        matched_cfg = it
-                        break
-                if matched_cfg:
-                    plant_name_cfg = matched_cfg.get('name')
-                    plant_rarity = matched_cfg.get('rarity', 'common')
-                    if plant_name_cfg in FULL_ORDER:
-                        position_mode = True
-                        plant_idx = FULL_ORDER.index(plant_name_cfg)
-                        threshold_source = f"plant position '{effective_plant_threshold}' (index={plant_idx})"
-                    else:
-                        effective_threshold_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
-                        threshold_source = f"plant '{effective_plant_threshold}' (rarity={plant_rarity})"
-                else:
-                    threshold_source = f"rarity >= {guild_cfg.get('rarity') if guild_cfg else RARITY_THRESHOLD_NAME} (plant threshold '{effective_plant_threshold}' not found on page)"
-
-            # Decide if the inspected plant meets the effective threshold
-            meets = False
-            if position_mode and plant_idx is not None:
-                if name in FULL_ORDER:
-                    meets = FULL_ORDER.index(name) >= plant_idx
-                else:
-                    compare_value = RARITY_PRIORITY.get(plant_rarity, effective_threshold_value)
-                    meets = RARITY_PRIORITY.get(rarity, 0) >= compare_value
-            else:
-                meets = RARITY_PRIORITY.get(rarity, 0) >= effective_threshold_value
-
-            lines.append(f"Effective threshold used for comparison: {threshold_source}")
-            lines.append(f"Does '{name}' meet the effective threshold? {'YES' if meets else 'NO'}")
-            await ctx.send("\n".join(lines))
-            return
-
-        # If no specific plant requested but plant threshold is configured, try to show what plant is being used as threshold
-        if effective_plant_threshold:
-            pname_cfg = effective_plant_threshold.strip().lower()
-            matched_cfg = None
-            for it in items:
-                if (it.get('name') or '').lower() == pname_cfg or pname_cfg in (it.get('name') or '').lower():
-                    matched_cfg = it
-                    break
-            if matched_cfg:
-                p_name = matched_cfg.get('name')
-                p_rarity = matched_cfg.get('rarity')
-                lines.append(f"Configured plant threshold '{effective_plant_threshold}' found on page as '{p_name}' with rarity {p_rarity}.")
-                if p_name in FULL_ORDER:
-                    lines.append(f"Using position-based threshold: items at or after index {FULL_ORDER.index(p_name)} in FULL_ORDER will qualify.")
-                else:
-                    lines.append(f"Plant not in canonical FULL_ORDER; falling back to rarity-based threshold using rarity '{p_rarity}'.")
-            else:
-                lines.append(f"Configured plant threshold '{effective_plant_threshold}' was not found on the current page (tab {sel}).")
-
-        await ctx.send("\n".join(lines))
+        return json.loads(WATCHLIST_PATH.read_text(encoding='utf-8') or '{}')
+    except FileNotFoundError:
+        return {}
     except Exception as e:
-        await ctx.send(f"Error while inspecting page: {e}")
+        _dprint(f"[WARN] failed to load {WATCHLIST_PATH.name}: {e}")
+        return {}
 
-async def _notify_all_guilds(message: str):
-    """Send message to the first writable text channel in each guild. Returns number of guilds messaged."""
-    sent = 0
-    for guild in bot.guilds:
-        for channel in guild.text_channels:
-            perms = channel.permissions_for(guild.me or bot.user)
-            if perms.send_messages:
-                try:
-                    await channel.send(message)
-                    sent += 1
-                except Exception:
-                    pass
-                break
-    print(f"_notify_all_guilds: attempted to send message to {sent} guild(s)")
-    return sent
+def save_watchlist(data: Dict[str, List[str]]):
+    try:
+        WATCHLIST_PATH.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    except Exception as e:
+        _dprint(f"[WARN] failed to save {WATCHLIST_PATH.name}: {e}")
 
-async def _notify_guilds_with_items(page_url: str, items: list, threshold_source: str) -> int:
-    """Notify each guild according to its own configured threshold/plant; return number of guilds messaged.
-    items should be the list of in-stock item dicts extracted from the page (name, stockText, count, rarity).
-    This function applies per-guild filtering and per-guild dedupe state.
-    """
-    sent = 0
-    for guild in bot.guilds:
-        cfg = _get_guild_config_for(guild.id)
-        # Determine effective threshold for this guild
-        # If the guild has not configured either a rarity or plant threshold, skip notifying it.
-        if cfg.get('rarity') is None and not cfg.get('plant'):
-            # clear any previous dedupe state for this guild+page so admins can enable later
-            _last_threshold_notified.pop(f"{page_url}::{guild.id}", None)
-            continue
+def get_guild_watch(guild_id: int) -> Set[str]:
+    wl = load_watchlist()
+    items = wl.get(str(guild_id)) or []
+    return set(_norm_item_key(x) for x in items)
 
-        effective_value = RARITY_PRIORITY.get(cfg.get('rarity'), RARITY_THRESHOLD_VALUE) if cfg.get('rarity') is not None else RARITY_THRESHOLD_VALUE
-        position_mode = False
-        plant_idx = None
-        plant_rarity = None
-        # If guild configured a plant-based threshold, try to find it in the items
-        if cfg.get('plant'):
-            pname = cfg.get('plant').strip().lower()
-            matched = None
-            for it in items:
-                if (it.get('name') or '').lower() == pname or pname in (it.get('name') or '').lower():
-                    matched = it
-                    break
-            if matched:
-                plant_rarity = matched.get('rarity', 'common')
-                if matched.get('name') in FULL_ORDER:
-                    position_mode = True
-                    plant_idx = FULL_ORDER.index(matched.get('name'))
-                else:
-                    effective_value = RARITY_PRIORITY.get(plant_rarity, effective_value)
+def set_guild_watch(guild_id: int, items: List[str]):
+    wl = load_watchlist()
+    wl[str(guild_id)] = sorted(set(_norm_item_key(x) for x in items))
+    save_watchlist(wl)
 
-        # Filter items per guild using position_mode or rarity
-        filtered = []
-        if position_mode and plant_idx is not None:
-            for it in items:
-                name = it.get('name')
-                if name in FULL_ORDER:
-                    if FULL_ORDER.index(name) >= plant_idx:
-                        filtered.append(it)
-                else:
-                    compare_value = RARITY_PRIORITY.get(plant_rarity, effective_value)
-                    if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= compare_value:
-                        filtered.append(it)
+# If guild has a non-empty watchlist, filter notifications to ONLY those items.
+def filter_inventory_by_watch(inv: List[Dict[str, Any]], guild_id: int) -> List[Dict[str, Any]]:
+    watched = get_guild_watch(guild_id)
+    if not watched:
+        return []
+    watched_keys: Set[str] = set()
+    for w in watched:
+        watched_keys.add(_sk(w))
+        watched_keys.add(_base(w))
+    out = []
+    for it in inv:
+        name = it.get('name') or ''
+        if {_sk(name), _base(name)} & watched_keys:
+            out.append(it)
+    return out
+
+# ---------- JSON patch helpers ----------
+def _ptr_decode(seg: str) -> str:
+    return seg.replace("~1", "/").replace("~0", "~")
+
+def _get_parent_and_key(root: Any, pointer: str):
+    if pointer == "" or pointer == "/":
+        return None, None
+    parts = [p for p in pointer.split("/") if p != ""]
+    cur = root
+    for raw in parts[:-1]:
+        seg = _ptr_decode(raw)
+        if isinstance(cur, list):
+            cur = cur[int(seg)]
         else:
-            filtered = [it for it in items if RARITY_PRIORITY.get(it.get('rarity','common'), 0) >= effective_value]
+            cur = cur[seg]
+    last = _ptr_decode(parts[-1])
+    return cur, last
 
-        if not filtered:
-            # no items meet this guild's threshold
-            # clear per-guild dedupe state for this page so future finds will notify
-            _last_threshold_notified.pop(f"{page_url}::{guild.id}", None)
-            continue
+def _op_replace(root: Any, pointer: str, value: Any):
+    parent, key = _get_parent_and_key(root, pointer)
+    if parent is None:
+        return value
+    if isinstance(parent, list):
+        parent[int(key)] = value
+    else:
+        parent[key] = value
+    return root
 
-        # Dedupe: check previous names for this guild+page
-        current_names = {it.get('name') for it in filtered}
-        key = f"{page_url}::{guild.id}"
-        prev_names = _last_threshold_notified.get(key, set())
-        notify_on_new = cfg.get('notify_on_new_only', NOTIFY_ON_NEW_ONLY)
-        if notify_on_new:
-            new_names = current_names - prev_names
-            if not new_names and prev_names:
-                # nothing new to notify for this guild
-                _last_threshold_notified[key] = current_names
-                continue
+def _op_add(root: Any, pointer: str, value: Any):
+    parent, key = _get_parent_and_key(root, pointer)
+    if parent is None:
+        return value
+    if isinstance(parent, list):
+        k = int(key)
+        if k == len(parent):
+            parent.append(value)
+        else:
+            parent.insert(k, value)
+    else:
+        parent[key] = value
+    return root
 
-        # Choose channel: configured channel_id takes precedence
-        channel = None
-        cid = cfg.get('channel_id')
-        if cid:
-            try:
-                channel = guild.get_channel(int(cid))
-            except Exception:
-                channel = None
-        if not channel:
-            # fallback to first writable text channel
-            for c in guild.text_channels:
-                perms = c.permissions_for(guild.me or bot.user)
-                if perms.send_messages:
-                    channel = c
-                    break
-        if not channel:
-            continue
+def _op_remove(root: Any, pointer: str):
+    parent, key = _get_parent_and_key(root, pointer)
+    if parent is None:
+        return {}
+    if isinstance(parent, list):
+        parent.pop(int(key))
+    else:
+        parent.pop(key, None)
+    return root
 
-        # Build message and send
-        lines = [f"@everyone MAGIC GARDEN ALERT for {guild.name}: Items found matching threshold ({threshold_source}):"]
-        for it in filtered:
-            count = it.get('count')
-            stock = it.get('stockText') or ''
-            if count is not None:
-                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
-            else:
-                lines.append(f"- {it.get('name')} — {stock} — {it.get('rarity')}")
+def apply_patches(root: Any, patches: List[Dict[str, Any]]) -> Any:
+    for p in patches:
+        op = p.get("op")
+        path = p.get("path", "")
+        if op == "replace":
+            root = _op_replace(root, path, p.get("value"))
+        elif op == "add":
+            root = _op_add(root, path, p.get("value"))
+        elif op == "remove":
+            root = _op_remove(root, path)
+    return root
+
+# ---------- Normalization ----------
+def _current_stock(item: Dict[str, Any]) -> int:
+    for k in ("remainingStock", "currentStock", "stock", "available", "qty", "quantity"):
+        if k in item and isinstance(item[k], (int, float)):
+            return int(item[k])
+    if "initialStock" in item and "sold" in item:
         try:
-            await channel.send("\n".join(lines))
-            sent += 1
-            _last_threshold_notified[key] = current_names
+            return max(int(item["initialStock"]) - int(item["sold"]), 0)
         except Exception:
             pass
-    print(f"_notify_guilds_with_items: notified {sent} guild(s)")
-    return sent
+    return int(item.get("initialStock", 0) or 0)
 
-async def _parse_page_for_restock_and_alert(page):
-    """Returns True if restock banner found and notifications sent for new mythic+ items."""
+def _display_name(item: Dict[str, Any]) -> str:
+    return (item.get("displayName")
+            or item.get("name")
+            or item.get("species")
+            or item.get("toolId")
+            or item.get("eggId")
+            or item.get("decorId")
+            or item.get("id")
+            or "unknown")
+
+def normalize_shops(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        # Quick check: is the restock banner present on the page?
-        has_restock = await page.evaluate(r"""
-            () => {
-                try {
-                    const text = document.body.innerText || '';
-                    return /Seeds\s+Restocked!/i.test(text);
-                } catch (e) { return false; }
-            }
-        """)
-        if not has_restock:
-            # clear previous flag for this page so future restocks notify again
-            _last_restock_notified.pop(page.url, None)
-            return False
-
-        # If we've already notified for this page while banner still present, skip
-        if _last_restock_notified.get(page.url):
-            return False
-
-        # Extract items with name, stockText, count and rarity (simple heuristics)
-        items = await page.evaluate(r"""
-            () => {
-                const out = [];
-                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
-                for (const card of cards) {
-                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
-                    const itemNameEl = nameEl;
-                    const itemName = (itemNameEl && itemNameEl.textContent || '').trim();
-                    if (!itemName) continue;
-
-                    // stock text
-                    let stockEl = card.querySelector('.McFlex.css-n6egec p.chakra-text') ||
-                                  Array.from(card.querySelectorAll('p.chakra-text, span, div')).find(n => /X\s*\d+|no\s+local|no\s+stock/i.test(n.textContent||''));
-                    const stockText = (stockEl && stockEl.textContent || '').trim();
-                    const m = stockText.match(/X\s*(\d+)/i);
-                    const count = m ? parseInt(m[1], 10) : null;
-
-                    // rarity heuristics: look for words like Celestial/Divine/Mythic/Legendary/Epic/Rare near the card
-                    const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
-                    let rarity = 'common';
-                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
-                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
-                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
-                    else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
-                    else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
-                    else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
-                    else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
-
-                    out.push({name: itemName, stockText, count, rarity});
-                }
-                return out;
-            }
-        """)
-
-        if not items:
-            _last_restock_notified[page.url] = True
-            return False
-
-        # Filter for mythic-and-above by priority
-        mythic_and_above = [it for it in items if RARITY_PRIORITY.get(it.get('rarity','common'),0) >= RARITY_THRESHOLD_VALUE]
-        if not mythic_and_above:
-            _last_restock_notified[page.url] = True
-            return False
-
-        # Instead of sending a separate restock-specific message, defer to the unified
-        # threshold scanner which will send notifications according to the configured threshold.
-        try:
-            sent = await _scan_and_notify_threshold(page)
-        except Exception:
-            sent = False
-        # Mark that we've processed this restock banner so we don't repeatedly handle it
-        _last_restock_notified[page.url] = True
-        return bool(sent)
+        child = state["child"]["data"]
+        shops = child["shops"]
     except Exception:
-        return False
-
-async def _check_timer_and_alert(page):
-    """Check the page for the timer element (.css-1srsqcm). If TRIGGER_MIN/TRIGGER_SEC are not
-    configured, this check is skipped. Returns True if notifications were sent."""
-    # If no trigger configured, skip this check
-    if TRIGGER_MIN is None or TRIGGER_SEC is None:
-        return False
-    try:
-        # grab the visible text of the timer container
-        txt = await page.evaluate(r"""
-            () => {
-                const el = document.querySelector('.css-1srsqcm');
-                return el ? (el.innerText || '').trim() : null;
-            }
-        """)
-        if not txt:
-            _last_timer_notified.pop(page.url, None)
-            return False
-
-        # find the first two numeric groups (minutes, seconds)
-        found = re.findall(r"(\d{1,2})", txt)
-        if len(found) < 2:
-            return False
-        minutes = int(found[0])
-        seconds = int(found[1])
-
-        if (minutes, seconds) != (TRIGGER_MIN, TRIGGER_SEC):
-            # clear previous flag so a future match will notify again
-            _last_timer_notified.pop(page.url, None)
-            return False
-
-        # dedupe: avoid notifying repeatedly while timer stays at the same value
-        key = f"{TRIGGER_MIN}:{TRIGGER_SEC}"
-        if _last_timer_notified.get(page.url) == key:
-            return False
-
-        # Reuse the same DOM extraction as the restock path to collect items with rarity
-        items = await page.evaluate(r"""
-            () => {
-                const out = [];
-                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
-                for (const card of cards) {
-                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
-                    const itemNameEl = nameEl;
-                    const itemName = (itemNameEl && itemNameEl.textContent || '').trim();
-                    if (!itemName) continue;
-
-                    let stockEl = card.querySelector('.McFlex.css-n6egec p.chakra-text') ||
-                                  Array.from(card.querySelectorAll('p.chakra-text, span, div')).find(n => /X\s*\d+|no\s+local|no\s+stock/i.test(n.textContent||''));
-                    const stockText = (stockEl && stockEl.textContent || '').trim();
-                    const m = stockText.match(/X\s*(\d+)/i);
-                    const count = m ? parseInt(m[1], 10) : null;
-
-                    const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
-                    let rarity = '';
-                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
-                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
-                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
-                    else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
-                    else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
-                    else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
-                    else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
-                    else rarity = 'common';
-
-                    out.push({name: itemName, stockText, count, rarity});
-                }
-                return out;
-            }
-        """)
-
-        if not items:
-            _last_timer_notified[page.url] = key
-            return False
-
-        # Filter items that appear to be in stock (exclude those with explicit NO/NO LOCAL STOCK labels)
-        in_stock = []
-        no_stock_re = re.compile(r"no\s+local\s+stock|no\s+local|no\s+stock", re.I)
-        for it in items:
-            stock_text = (it.get('stockText') or '')
-            if no_stock_re.search(stock_text):
-                continue
-            if it.get('count') is not None or re.search(r"X\s*\d+", stock_text or '', re.I):
-                in_stock.append(it)
-
-        if not in_stock:
-            _last_timer_notified[page.url] = key
-            return False
-
-        # Instead of broadcasting one raw message to all guilds, use per-guild filtering and notify
-        sent = await _notify_guilds_with_items(page.url, in_stock, f"timer {TRIGGER_MIN}:{TRIGGER_SEC:02d}")
-
-        _last_timer_notified[page.url] = key
-        return bool(sent)
-    except Exception:
-        return False
-
-async def _scan_and_notify_threshold(page):
-    """Scan a page for items at or above the configured rarity threshold.
-    If any qualifying items are found and at least one is new since the last scan for this page,
-    send a message to all guilds listing the currently available qualifying items.
-    Returns True if a notification was sent.
-    """
-    try:
-        print(f"_scan_and_notify_threshold: scanning page {getattr(page, 'url', 'unknown')}")
-        items = await page.evaluate(r"""
-            () => {
-                const out = [];
-                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
-                for (const card of cards) {
-                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
-                    const itemNameEl = nameEl;
-                    const itemName = (itemNameEl && itemNameEl.textContent || '').trim();
-                    if (!itemName) continue;
-
-                    let stockEl = card.querySelector('.McFlex.css-n6egec p.chakra-text') ||
-                                  Array.from(card.querySelectorAll('p.chakra-text, span, div')).find(n => /X\s*\d+|no\s+local|no\s+stock/i.test(n.textContent||''));
-                    const stockText = (stockEl && stockEl.textContent || '').trim();
-                    const m = stockText.match(/X\s*(\d+)/i);
-                    const count = m ? parseInt(m[1], 10) : null;
-
-                    const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
-                    let rarity = '';
-                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
-                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
-                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
-                    else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
-                    else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
-                    else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
-                    else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
-                    else rarity = 'common';
-
-                    out.push({name: itemName, stockText, count, rarity});
-                }
-                return out;
-            }
-        """)
-
-        if not items:
-            print(f"_scan_and_notify_threshold: no items found on {getattr(page, 'url', 'unknown')}")
-            # clear per-page per-guild state
-            keys = [k for k in _last_threshold_notified.keys() if k.startswith(f"{page.url}::")]
-            for k in keys:
-                _last_threshold_notified.pop(k, None)
-            return False
-
-        # Filter to items that appear to be in stock (exclude those with explicit NO/NO LOCAL STOCK labels)
-        in_stock = []
-        no_stock_re = re.compile(r"no\s+local\s+stock|no\s+local|no\s+stock", re.I)
-        for it in items:
-            stock_text = (it.get('stockText') or '')
-            if no_stock_re.search(stock_text):
-                continue
-            if it.get('count') is not None or re.search(r"X\s*\d+", stock_text or '', re.I):
-                in_stock.append(it)
-
-        if not in_stock:
-            # clear per-page per-guild state
-            keys = [k for k in _last_threshold_notified.keys() if k.startswith(f"{page.url}::")]
-            for k in keys:
-                _last_threshold_notified.pop(k, None)
-            return False
-
-        # Use the new per-guild notifier which will apply each guild's config and dedupe separately.
-        sent = await _notify_guilds_with_items(page.url, in_stock, "server-configured threshold")
-        print(f"_scan_and_notify_threshold: notification sent={bool(sent)} to {sent} guild(s)")
-        return bool(sent)
-    except Exception as e:
-        print(f"_scan_and_notify_threshold: error: {e}")
-        return False
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    # Reload persisted guild settings and apply them to any guilds we're currently in.
-    # This makes sure configurations saved to guild_settings.json are actually reloaded
-    # and validated when the bot restarts so server admins don't need to reconfigure.
-    _load_guild_settings()
-
-    # Validate and apply per-guild settings: check that configured channel IDs still exist
-    # and populate missing keys with sensible defaults. Persist any corrections.
-    changed = False
-    applied_count = 0
-    for gid_str, cfg in list(GUILD_SETTINGS.items()):
-        try:
-            gid = int(gid_str)
-        except Exception:
-            continue
-        guild = bot.get_guild(gid)
-        if not guild:
-            # Guild not available (bot may have been removed) — keep config on disk for future use
-            continue
-        applied_count += 1
-        # Ensure notify_on_new_only field exists
-        if 'notify_on_new_only' not in cfg:
-            cfg['notify_on_new_only'] = NOTIFY_ON_NEW_ONLY
-            GUILD_SETTINGS[gid_str] = cfg
-            changed = True
-        # Validate channel_id: if configured but channel no longer exists, clear it
-        cid = cfg.get('channel_id')
-        if cid is not None:
-            try:
-                ch = guild.get_channel(int(cid))
-            except Exception:
-                ch = None
-            if ch is None:
-                cfg.pop('channel_id', None)
-                GUILD_SETTINGS[gid_str] = cfg
-                changed = True
-
-    if changed:
-        _save_guild_settings()
-
-    print(f"Applied saved settings for {applied_count} guild(s)")
-
-    # NOTE: Do not auto-start the periodic watcher here unless --periodic-start was provided.
-    if PERIODIC_START_TIME:
-        async def _schedule_start():
-            hh, mm, ss = PERIODIC_START_TIME
-            # Interpret the provided time as America/Chicago local time regardless of host timezone.
-            chicago_tz = ZoneInfo("America/Chicago")
-            now_chi = datetime.now(tz=chicago_tz)
-            target_chi = now_chi.replace(hour=hh, minute=mm, second=ss, microsecond=0)
-            if target_chi <= now_chi:
-                target_chi += timedelta(days=1)
-            # Convert to UTC and compute delay relative to host clock (UTC-aware) to get correct sleep seconds
-            now_utc = datetime.now(tz=ZoneInfo("UTC"))
-            target_utc = target_chi.astimezone(ZoneInfo("UTC"))
-            delay = (target_utc - now_utc).total_seconds()
-            print(f"Scheduled periodic seed check to start at {hh:02d}:{mm:02d}:{ss:02d} America/Chicago (in {int(delay)}s)")
-            await asyncio.sleep(delay)
-            # start the periodic check at the scheduled time (default defined by PERIODIC_INTERVAL_SECONDS)
-            if getattr(bot, '_periodic_task', None) and not bot._periodic_task.done():
-                print('Periodic task already running at scheduled start')
-                return
-            bot._periodic_task = bot.loop.create_task(_periodic_seed_check(PERIODIC_INTERVAL_SECONDS))
-            print('Periodic seed check started by schedule')
-        bot.loop.create_task(_schedule_start())
-
-# New: periodic seed check task (default 5 minutes) and control commands
-async def _periodic_seed_check(interval_seconds: int = PERIODIC_INTERVAL_SECONDS):
-    """Periodically run a single seed check across attached pages every interval_seconds.
-    Uses a monotonic clock to keep iteration START times spaced evenly to avoid drift.
-    """
-    # Schedule the first iteration to start immediately (monotonic anchor)
-    next_start = time.monotonic()
-    while True:
-        try:
-            # Mark the start of this iteration
-            start = time.monotonic()
-
-            attached = await _ensure_attached(CDP_DEFAULT)
-            print(f"_periodic_seed_check: _ensure_attached -> {attached}")
-            if not attached:
-                # wait and retry next loop
-                await asyncio.sleep(interval_seconds)
-                # adjust the anchor so we don't accumulate drift when endpoint is missing
-                next_start = time.monotonic()
-                continue
-
-            pages = await _get_pages()
-            print(f"_periodic_seed_check: checking {len(pages)} page(s)")
-            for page in pages:
-                print(f"_periodic_seed_check: scanning page {getattr(page,'url', 'unknown')}")
-                # Reuse existing parsing/alert functions
-                try:
-                    # If the restock path sends notifications it returns True; capture that so
-                    # we don't run the threshold scanner in the same iteration and duplicate messages.
-                    restock_sent = False
-                    try:
-                        restock_sent = await _parse_page_for_restock_and_alert(page)
-                    except Exception as e:
-                        print(f"_periodic_seed_check: restock parse error for {getattr(page,'url','unknown')}: {e}")
-
-                    try:
-                        await _check_timer_and_alert(page)
-                    except Exception as e:
-                        print(f"_periodic_seed_check: timer check error for {getattr(page,'url','unknown')}: {e}")
-
-                    if restock_sent:
-                        print(f"_periodic_seed_check: restock handler already sent notification for {getattr(page,'url','unknown')}, skipping threshold scan")
-                    else:
-                        # New: scan for items meeting rarity threshold and notify automatically
-                        try:
-                            await _scan_and_notify_threshold(page)
-                        except Exception as e:
-                            print(f"_periodic_seed_check: threshold scan error for {getattr(page,'url','unknown')}: {e}")
-                except Exception as e:
-                    print(f"_periodic_seed_check: per-page top-level error for {getattr(page,'url','unknown')}: {e}")
-        except Exception as e:
-            print(f"_periodic_seed_check: top-level error: {e}")
-
-        # Compute next scheduled start and sleep the remaining time using monotonic clock
-        next_start += interval_seconds
-        sleep_for = next_start - time.monotonic()
-        if sleep_for > 0:
-            await asyncio.sleep(sleep_for)
-        else:
-            # Overrun: the work took longer than the interval. Log and continue immediately.
-            print(f"_periodic_seed_check: iteration overran by {-sleep_for:.1f}s; continuing immediately")
-
-@bot.command(name="start_periodic_check")
-@commands.is_owner()
-async def start_periodic_check(ctx, minutes: Optional[int] = None):
-    """Owner-only: start the periodic seed check every <minutes> (default uses PERIODIC_INTERVAL_SECONDS).
-    If minutes is omitted the bot uses the global PERIODIC_INTERVAL_SECONDS value defined in the source.
-    """
-    if getattr(bot, '_periodic_task', None) and not bot._periodic_task.done():
-        await ctx.send("Periodic seed check already running.")
-        return
-    if minutes is None:
-        interval = PERIODIC_INTERVAL_SECONDS
-    else:
-        interval = int(minutes) * 60
-    bot._periodic_task = bot.loop.create_task(_periodic_seed_check(interval))
-    # Respond with minutes used for readability
-    await ctx.send(f"Started periodic seed check every {interval//60} minutes.")
-
-@bot.command(name="stop_periodic_check")
-@commands.is_owner()
-async def stop_periodic_check(ctx):
-    """Owner-only: stop the periodic seed check."""
-    task = getattr(bot, '_periodic_task', None)
-    if not task:
-        await ctx.send("No periodic seed check is running.")
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    bot._periodic_task = None
-    await ctx.send("Stopped periodic seed check.")
-
-@bot.command(name="run_seed_check")
-@commands.is_owner()
-async def run_seed_check(ctx):
-    """Owner-only: run a one-off seed check immediately."""
-    await ctx.send("Running seed check now...")
-    if not getattr(bot, 'browser', None):
-        await _ensure_attached(CDP_DEFAULT)
-    pages = await _get_pages()
-    for page in pages:
-        await _parse_page_for_restock_and_alert(page)
-        await _check_timer_and_alert(page)
-    await ctx.send("Seed check complete.")
-
-# Helper: send as inline code block if short, otherwise as file
-def _chunk_or_file_payload(text: str, fname: str = "page.html") -> dict:
-    if len(text) <= 1900:
-        return {"content": f"```html\n{text}\n```"}
-    return {"file": discord.File(io.BytesIO(text.encode("utf-8")), filename=fname)}
-
-async def _ensure_attached(endpoint: str = CDP_DEFAULT):
-    """Ensure the bot is connected to an external browser via CDP at endpoint.
-    Returns True on success. The bot will not launch its own browser; it will attach to the
-    user-managed browser so you can prepare tabs/pages manually."""
-    # If we already have a connected browser, we're good
-    if getattr(bot, 'browser', None):
-        return True
-    try:
-        if not getattr(bot, 'playwright', None):
-            bot.playwright = await async_playwright().start()
-        # Connect to external browser over CDP
-        bot.browser = await bot.playwright.chromium.connect_over_cdp(endpoint)
-        # Mark that this is an external connection so close() doesn't try to shut it down
-        bot._connected_over_cdp = True
-        return True
-    except Exception as e:
-        print(f"Failed to connect to external CDP endpoint {endpoint}: {e}")
-        return False
-
-async def _get_pages() -> list:
-    if not getattr(bot, 'browser', None):
-        return []
-    # refresh pages list across all contexts
-    bot.cdp_pages = [p for c in bot.browser.contexts for p in c.pages]
-    return bot.cdp_pages
-
-@bot.command(name="current_html")
-async def current_html(ctx, index: Optional[int] = None, endpoint: Optional[str] = None):
-    """Return the current HTML of the headless browser's page.
-
-    Usage:
-      !current_html              -> returns HTML of the first open tab
-      !current_html 1            -> returns HTML of tab index 1
-      !current_html 0 http://127.0.0.1:9222 -> specify CDP endpoint explicitly
-    """
-    endpoint = endpoint or CDP_DEFAULT
-    attached = await _ensure_attached(endpoint)
-    if not attached:
-        await ctx.send(f"Failed to attach to CDP endpoint: {endpoint}")
-        return
-
-    pages = await _get_pages()
-    if not pages:
-        await ctx.send("No open pages found in the attached browser.")
-        return
-
-    sel = 0 if index is None else int(index)
-    if sel < 0 or sel >= len(pages):
-        await ctx.send(f"Invalid index {sel}. Must be between 0 and {len(pages)-1}.")
-        return
-
-    page = pages[sel]
-    try:
-        content = await page.content()
-        payload = _chunk_or_file_payload(content, fname="current_page.html")
-        if "content" in payload:
-            await ctx.send(payload["content"])
-        else:
-            await ctx.send(file=payload["file"])
-    except Exception as e:
-        await ctx.send(f"Error retrieving page content: {e}")
-
-@bot.command(name="screenshot")
-async def screenshot(ctx, index: Optional[int] = None, full: bool = False, endpoint: Optional[str] = None):
-    """Capture a screenshot of the selected headless browser tab.
-
-    Usage:
-      !screenshot               -> screenshot of first tab (viewport)
-      !screenshot 1             -> screenshot of tab index 1 (viewport)
-      !screenshot 0 true        -> full-page screenshot of tab 0
-      !screenshot 0 false http://127.0.0.1:9222 -> specify CDP endpoint
-    """
-    endpoint = endpoint or CDP_DEFAULT
-    attached = await _ensure_attached(endpoint)
-    if not attached:
-        await ctx.send(f"Failed to attach to CDP endpoint: {endpoint}")
-        return
-
-    pages = await _get_pages()
-    if not pages:
-        await ctx.send("No open pages found in the attached browser.")
-        return
-
-    sel = 0 if index is None else int(index)
-    if sel < 0 or sel >= len(pages):
-        await ctx.send(f"Invalid index {sel}. Must be between 0 and {len(pages)-1}.")
-        return
-
-    page = pages[sel]
-    try:
-        png = await page.screenshot(full_page=bool(full))
-        await ctx.send(file=discord.File(io.BytesIO(png), filename="screenshot.png"))
-    except Exception as e:
-        await ctx.send(f"Error capturing screenshot: {e}")
-
-@bot.command(name="in_stock")
-async def in_stock(ctx, index: Optional[int] = None, endpoint: Optional[str] = None):
-    """List items currently in stock on the selected headless browser page.
-
-    Usage:
-      !in_stock                -> check first open tab
-      !in_stock 1              -> check tab index 1
-      !in_stock 0 http://...   -> specify CDP endpoint
-
-    The command looks for shop/cards rendered as buttons (button.chakra-button) and
-    reads the name and stock label (e.g. "X7 Stock" vs "NO STOCK" / "NO LOCAL STOCK").
-    """
-    endpoint = endpoint or CDP_DEFAULT
-    attached = await _ensure_attached(endpoint)
-    if not attached:
-        await ctx.send(f"Failed to attach to CDP endpoint: {endpoint}")
-        return
-
-    pages = await _get_pages()
-    if not pages:
-        await ctx.send("No open pages found in the attached browser.")
-        return
-
-    sel = 0 if index is None else int(index)
-    if sel < 0 or sel >= len(pages):
-        await ctx.send(f"Invalid index {sel}. Must be between 0 and {len(pages)-1}.")
-        return
-
-    page = pages[sel]
-    try:
-        # JS runs in the page and returns an array of {name, stockText, count}
-        results = await page.evaluate(r"""
-            () => {
-                const out = [];
-                // Find candidate card buttons
-                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
-                for (const card of cards) {
-                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
-                    const itemNameEl = nameEl;
-                    const itemName = (itemNameEl && itemNameEl.textContent || '').trim();
-                    if (!itemName) continue;
-
-                    // stock text appears in a nearby .McFlex.css-n6egec p or similar
-                    let stockEl = card.querySelector('.McFlex.css-n6egec p.chakra-text') ||
-                                  Array.from(card.querySelectorAll('p.chakra-text, span, div')).find(n => /stock|no\s+local|no\s+stock/i.test(n.textContent||''));
-                    const stockText = (stockEl && stockEl.textContent || '').trim();
-
-                    const noStock = /no\s+local\s+stock|no\s+local|no\s+stock/i.test(stockText);
-                    const m = stockText.match(/X\s*(\d+)/i);
-                    const count = m ? parseInt(m[1], 10) : null;
-
-                    const inStock = !noStock && (count !== null || /X\d+/i.test(stockText));
-                    if (inStock) out.push({name: itemName, stockText, count});
-                }
-                return out;
-            }
-        """)
-
-        if not results:
-            await ctx.send("No items currently in stock were detected on the page.")
-            return
-
-        lines = []
-        for r in results:
-            if r.get('count') is not None:
-                lines.append(f"- {r.get('name')} — {r.get('stockText')} ({r.get('count')} units)")
-            else:
-                lines.append(f"- {r.get('name')} — {r.get('stockText')}")
-        msg = "\n".join(lines)
-        if len(msg) <= 1900:
-            await ctx.send("```\n" + msg + "\n```")
-        else:
-            await ctx.send(file=discord.File(io.BytesIO(msg.encode('utf-8')), filename='in_stock.txt'))
-    except Exception as e:
-        await ctx.send(f"Error during in_stock parse: {e}")
-
-@bot.command(name="list_plants")
-async def list_plants(ctx, index: Optional[int] = None, endpoint: Optional[str] = None):
-    """List all item names currently scraped from the page.
-
-    Usage:
-      !list_plants                -> list names from first open tab
-      !list_plants 1              -> list names from tab index 1
-      !list_plants 0 http://...   -> specify CDP endpoint
-    """
-    endpoint = endpoint or CDP_DEFAULT
-    attached = await _ensure_attached(endpoint)
-    if not attached:
-        await ctx.send(f"Failed to attach to CDP endpoint: {endpoint}")
-        return
-
-    pages = await _get_pages()
-    if not pages:
-        await ctx.send("No open pages found in the attached browser.")
-        return
-
-    sel = 0 if index is None else int(index)
-    if sel < 0 or sel >= len(pages):
-        await ctx.send(f"Invalid index {sel}. Must be between 0 and {len(pages)-1}.")
-        return
-
-    page = pages[sel]
-    try:
-        # Scrape name + heuristic rarity from the page, then sort using a supplied
-        # authoritative ordering and rarity map (falling back to the heuristic when
-        # an item is not in the map).
-        items = await page.evaluate(r"""
-            () => {
-                const out = [];
-                const cards = Array.from(document.querySelectorAll('button.chakra-button'));
-                for (const card of cards) {
-                    const nameEl = card.querySelector('p.chakra-text.css-swfl2y') || card.querySelector('p.chakra-text');
-                    const itemName = (nameEl && (nameEl.textContent || '').trim()) || '';
-                    if (!itemName) continue;
-                    const rarityCandidate = Array.from(card.querySelectorAll('p, span, div')).map(n => (n.textContent||'').toLowerCase()).join(' ');
-                    let rarity = 'common';
-                    if (/celestial/i.test(rarityCandidate)) rarity = 'celestial';
-                    else if (/divine/i.test(rarityCandidate)) rarity = 'divine';
-                    else if (/mythic|mythical/i.test(rarityCandidate)) rarity = 'mythic';
-                    else if (/legendary/i.test(rarityCandidate)) rarity = 'legendary';
-                    else if (/epic/i.test(rarityCandidate)) rarity = 'epic';
-                    else if (/rare/i.test(rarityCandidate)) rarity = 'rare';
-                    else if (/uncommon/i.test(rarityCandidate)) rarity = 'uncommon';
-                    out.push({name: itemName, rarity});
-                }
-                // Deduplicate by name while preserving first-seen order
-                const seen = new Set();
-                return out.filter(it => {
-                    if (seen.has(it.name)) return false;
-                    seen.add(it.name);
-                    return true;
-                });
-            }
-        """)
-
-        # Filter out spurious names that are just numeric badges (e.g. "1") or empty strings
-        items = [it for it in items if (it.get('name') or '').strip() and not re.match(r'^\d+$', (it.get('name') or '').strip())]
-
-        if not items:
-            await ctx.send("No item names were found on the page.")
-            return
-
-        # Authoritative ordering & rarities provided by the user. Items present in this
-        # list will be shown in this exact order and with the mapped rarity label.
-        FULL_ORDER = [
-            "Carrot Seed",
-            "Strawberry Seed",
-            "Aloe Seed",
-            "Blueberry Seed",
-            "Apple Seed",
-            "Tulip Seed",
-            "Tomato Seed",
-            "Daffodil Seed",
-            "Corn Kernel",
-            "Watermelon Seed",
-            "Pumpkin Seed",
-            "Echeveria Cutting",
-            "Coconut Seed",
-            "Banana Seed",
-            "Lily Seed",
-            "Burro's Tail Cutting",
-            "Mushroom Spore",
-            "Cactus Seed",
-            "Bamboo Seed",
-            "Grape Seed",
-            "Pepper Seed",
-            "Lemon Seed",
-            "Passion Fruit Seed",
-            "Dragon Fruit Seed",
-            "Lychee Pit",
-            "Sunflower Seed",
-            "Starweaver Pod",
-        ]
-
-        RARITY_MAP = {
-            "Carrot Seed": "Common",
-            "Strawberry Seed": "Common",
-            "Aloe Seed": "Common",
-            "Blueberry Seed": "Uncommon",
-            "Apple Seed": "Uncommon",
-            "Tulip Seed": "Uncommon",
-            "Tomato Seed": "Uncommon",
-            "Daffodil Seed": "Rare",
-            "Corn Kernel": "Rare",
-            "Watermelon Seed": "Rare",
-            "Pumpkin Seed": "Rare",
-            "Echeveria Cutting": "Legendary",
-            "Coconut Seed": "Legendary",
-            "Banana Seed": "Legendary",
-            "Lily Seed": "Legendary",
-            "Burro's Tail Cutting": "Legendary",
-            "Mushroom Spore": "Mythical",
-            "Cactus Seed": "Mythical",
-            "Bamboo Seed": "Mythical",
-            "Grape Seed": "Mythical",
-            "Pepper Seed": "Divine",
-            "Lemon Seed": "Divine",
-            "Passion Fruit Seed": "Divine",
-            "Dragon Fruit Seed": "Divine",
-            "Lychee Pit": "Divine",
-            "Sunflower Seed": "Divine",
-            "Starweaver Pod": "Celestial",
+        return {}
+
+    def norm(kind: str, item: Dict[str, Any]) -> Dict[str, Any]:
+        base = {
+            "name": _display_name(item),
+            "itemType": item.get("itemType", kind),
+            "initialStock": int(item.get("initialStock", 0) or 0),
+            "currentStock": _current_stock(item),
         }
+        if kind == "seed":
+            return {"id": item.get("species"), **base}
+        if kind == "tool":
+            return {"id": item.get("toolId"), **base}
+        if kind == "egg":
+            return {"id": item.get("eggId"), **base}
+        if kind == "decor":
+            return {"id": item.get("decorId"), **base}
+        return {"id": item.get("id"), **base}
 
-        # Build a name->heuristic_rarity map from the scraped items for fallback
-        heur = {it.get('name'): it.get('rarity') for it in items}
+    out = {"captured_at": int(time.time()), "currentTime": child.get("currentTime"), "shops": {}}
+    for kind in ("seed", "egg", "tool", "decor"):
+        s = shops.get(kind)
+        if not s:
+            continue
+        inv = s.get("inventory") or []
+        out["shops"][kind] = {
+            "secondsUntilRestock": s.get("secondsUntilRestock"),
+            "inventory": [norm(kind, it) for it in inv],
+        }
+    return out
 
-        def sort_key(it):
-            name = it.get('name')
-            if name in FULL_ORDER:
-                return (0, FULL_ORDER.index(name))
-            # unknown items go after known ones, sorted alphabetically
-            return (1, name.lower())
+# ---------- Formatting / printing ----------
+def _fmt_secs(secs: float) -> str:
+    secs = max(0, int(round(secs)))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-        items_sorted = sorted(items, key=sort_key)
+def _print_available(kind: str, kind_shop: Dict[str, Any]):
+    inv = (kind_shop or {}).get("inventory", [])
+    if PRINT_ONLY_AVAILABLE:
+        inv = [i for i in inv if int(i.get("currentStock", 0)) > 0]
+    if not inv:
+        _dprint(f"[RESTOCK] {kind}: (no items with stock > 0)")
+        return
+    items = ", ".join(f"{i['name']} (stock {i['currentStock']})" for i in inv)
+    _dprint(f"[RESTOCK] {kind}: {items}")
 
-        lines = []
-        for it in items_sorted:
-            name = it.get('name')
-            label = RARITY_MAP.get(name)
-            if not label:
-                # fallback: use scraped heuristic rarity and title-case it
-                label = (heur.get(name) or 'common').capitalize()
-            lines.append(f"{name} — {label}")
+def _format_seconds_verbose(s):
+    try:
+        s = float(s)
+    except Exception:
+        return 'N/A'
+    if s < 0:
+        return 'now'
+    s = int(s)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if s or not parts: parts.append(f"{s}s")
+    return " ".join(parts)
 
-        text = "\n".join(lines)
+def _format_seconds(s):
+    return _format_seconds_verbose(s)
 
-        # We no longer save/export to plants.json; the list is generated live from the page.
-
-        # Send the list; use a file if too long
-        if len(text) <= 1900:
-            await ctx.send("```\n" + text + "\n```")
-        else:
-            await ctx.send(file=discord.File(io.BytesIO(text.encode('utf-8')), filename='plants.txt'))
+# ---------- Load optional guild settings ----------
+def load_guild_settings() -> Dict[str, Any]:
+    try:
+        text = GUILD_SETTINGS_PATH.read_text(encoding='utf-8')
+        return json.loads(text or '{}')
+    except FileNotFoundError:
+        return {}
     except Exception as e:
-        await ctx.send(f"Error while scraping names: {e}")
+        _dprint(f"[WARN] failed to load guild_settings.json: {e}")
+        return {}
 
-if not DISCORD_TOKEN:
-    raise SystemExit("Missing DISCORD_TOKEN in .env")
+def save_guild_settings(data: Dict[str, Any]):
+    try:
+        GUILD_SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    except Exception as e:
+        _dprint(f"[WARN] failed to save guild_settings.json: {e}")
+    except Exception as e:
+        _dprint(f"[WARN] failed to load guild_settings.json: {e}")
+        return {}
 
-bot.run(DISCORD_TOKEN)
+# ---------- Discord notifier ----------
+class DiscordNotifier:
+    def __init__(self, client: discord.Client):
+        self.client = client
+
+    def _find_channel_for_guild(self, guild: discord.Guild, cfg: Dict[str, Any]):
+        # prefer explicit configured channel_id
+        cid = cfg.get('channel_id') if cfg else None
+        if cid:
+            try:
+                ch = self.client.get_channel(int(cid))
+                if ch and isinstance(ch, discord.TextChannel):
+                    if ch.permissions_for(guild.me).send_messages:
+                        return ch
+            except Exception:
+                pass
+        # try system channel
+        try:
+            if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+                return guild.system_channel
+        except Exception:
+            pass
+        # fallback: first text channel we can send to
+        for ch in getattr(guild, 'text_channels', []):
+            try:
+                if ch.permissions_for(guild.me).send_messages:
+                    return ch
+            except Exception:
+                continue
+        return None
+
+    def notify_snapshot(self, snapshot: Dict[str, Any]):
+        # Called from monitor thread; schedule coroutine on bot loop
+        loop = self.client.loop
+        async def _do():
+            guilds_cfg = load_guild_settings()
+            captured = snapshot.get('captured_at')
+            shops = snapshot.get('shops', {})
+            for guild in list(self.client.guilds):
+                cfg = guilds_cfg.get(str(guild.id), {})
+                if cfg.get('snapshot_enabled', True) is False:
+                    continue
+                kinds_enabled = cfg.get('kinds_enabled') if cfg else None
+                for kind, kind_shop in shops.items():
+                    try:
+                        if kinds_enabled is not None and not kinds_enabled.get(kind, True):
+                            continue
+
+                        inv_all = kind_shop.get('inventory', []) or []
+                        inv_all = [i for i in inv_all if int(i.get('currentStock', 0)) > 0] if PRINT_ONLY_AVAILABLE else inv_all
+                        # Filter by guild watchlist if present
+                        inv = filter_inventory_by_watch(inv_all, guild.id)
+                        if not inv:
+                            continue
+
+                        restock_str = _format_seconds(kind_shop.get('secondsUntilRestock'))
+                        title = f"Shop {kind} update"
+                        lines = [f"Captured: {time.ctime(captured)}", f"Restock in: {restock_str}", f"Items: {len(inv)} available (filtered)"]
+                        for it in inv[:20]:
+                            raw = it.get('name')
+                            ck = _canonical_vocab_key(raw)
+                            disp = ck.title() if ck else (raw or 'unknown')
+                            cur = int(it.get('currentStock', 0))
+                            init = int(it.get('initialStock', 0))
+                            rr = ITEM_RARITIES.get(ck or '', '')
+                            rc = rr.capitalize() if rr else ''
+                            lines.append(f"{disp} — {cur}/{init}" + (f" — {rc}" if rc else ""))
+                        if len(inv) > 20:
+                            lines.append(f"...and {len(inv)-20} more items")
+                        msg = "\n".join(lines)
+                        if len(msg) > 1900:
+                            msg = msg[:1900] + '\n...truncated'
+                        ch = self._find_channel_for_guild(guild, cfg)
+                        if ch:
+                            try:
+                                await ch.send(f"**{title}**\n{msg}")
+                            except Exception:
+                                try:
+                                    owner = guild.owner
+                                    if owner:
+                                        await owner.send(f"**{title}**\n{msg}")
+                                except Exception:
+                                    pass
+                    except Exception:
+                        continue
+        loop.create_task(_do())
+
+    def notify_restock(self, kind: str, kind_shop: Dict[str, Any]):
+        loop = self.client.loop
+        async def _do():
+            guilds_cfg = load_guild_settings()
+            for guild in list(self.client.guilds):
+                cfg = guilds_cfg.get(str(guild.id), {})
+                ch = self._find_channel_for_guild(guild, cfg)
+                if not ch:
+                    continue
+                inv_all = (kind_shop or {}).get('inventory', []) or []
+                inv_all = [i for i in inv_all if int(i.get('currentStock', 0)) > 0] if PRINT_ONLY_AVAILABLE else inv_all
+                inv = filter_inventory_by_watch(inv_all, guild.id)
+                if not inv:
+                    continue
+                header = f"@everyone\n**MAGIC GARDEN ALERT, {kind.capitalize()} restocked:**\n\n"
+                item_lines = []
+                for it in inv[:50]:
+                    raw = it.get('name') or _display_name(it)
+                    ck = _canonical_vocab_key(raw)
+                    disp = ck.title() if ck else (raw or 'unknown')
+                    cur = int(it.get('currentStock', 0))
+                    rr = ITEM_RARITIES.get(ck or '', '')
+                    rc = rr.capitalize() if rr else ''
+                    item_lines.append(f"{disp} — X {cur}" + (f" — {rc}" if rc else ""))
+                msg = header + "\n".join(item_lines)
+                if len(msg) > 1900:
+                    msg = msg[:1900] + '\n...truncated'
+                try:
+                    await ch.send(msg)
+                except Exception:
+                    try:
+                        owner = guild.owner
+                        if owner:
+                            await owner.send(msg)
+                    except Exception:
+                        pass
+        loop.create_task(_do())
+
+# ---------- Monitor (Playwright) ----------
+def monitor_loop(notifier: DiscordNotifier):
+    """Runs on its own thread. All Playwright actions happen here."""
+    global full_state, last_normalized, restock_timers, last_refresh_at, last_snapshot_bytes
+
+    def write_snapshot_if_changed(snapshot: Dict[str, Any], reason: str = ""):
+        """Keep snapshot in memory; optionally write to disk and/or log."""
+        global last_snapshot_bytes
+        try:
+            # Keep the snapshot in-memory so the administrative command can still return it,
+            # but do not perform any disk writes or noisy logging/notifications here.
+            data = json.dumps(snapshot, indent=2).encode("utf-8")
+            last_snapshot_bytes = data
+            # Signal that we have at least one snapshot available (so monitor can proceed)
+            written_first_snapshot.set()
+            # Signal that a fresh snapshot was captured (used by countdown to await refresh)
+            snapshot_updated.set()
+        except Exception as e:
+            _dprint(f"[ERROR] Failed to capture snapshot: {e}")
+
+    # ---- countdown thread (no Playwright here) ----
+    def countdown_loop():
+        kinds = ("seed", "egg", "tool", "decor")
+        while True:
+            now_mono = time.monotonic()
+            parts = []
+            with state_lock:
+                kinds_to_report = []
+                for k in kinds:
+                    rt = restock_timers.get(k)
+                    if rt and "secs" in rt and "t0" in rt:
+                        remain = float(rt["secs"]) - (now_mono - float(rt["t0"]))
+                        if remain <= 0:
+                            kinds_to_report.append(k)
+                            if LOCAL_SOFT_RESET_AT_ZERO:
+                                period = float(rt.get("period") or DEFAULT_PERIODS.get(k, 60.0))
+                                # reset using current monotonic baseline
+                                restock_timers[k] = {"secs": period, "t0": now_mono, "period": period}
+                                remain = period
+                        parts.append(f"{k} {_fmt_secs(remain)}")
+                    else:
+                        parts.append(f"{k} —")
+            _dprint("[COUNTDOWN] " + " | ".join(parts))
+
+            # Local report without forced reload
+            if kinds_to_report:
+                try:
+                    # Mark these kinds so the monitor thread can print/notify them if a fresh snapshot arrives.
+                    with state_lock:
+                        for k in kinds_to_report:
+                            pending_print_kinds.add(k)
+                    # clear previous snapshot marker and ask monitor thread to reload (force bypasses cooldown)
+                    snapshot_updated.clear()
+                    force_refresh_requested.set()
+                    waited = snapshot_updated.wait(timeout=8.0)
+                except Exception:
+                    waited = False
+
+                with state_lock:
+                    cur = last_normalized
+                    # For each kind, if the monitor already handled it (pending_print_kinds cleared), skip local notify.
+                    for k in kinds_to_report:
+                        try:
+                            already_handled = (k not in pending_print_kinds)
+                            if already_handled:
+                                continue
+                            # If we didn't get a fresh snapshot, skip sending (require refresh before notify)
+                            if not waited:
+                                _dprint(f"[LOCAL] Skipping {k} because no fresh snapshot was received after refresh.")
+                                # leave the pending flag in place so the monitor may still handle it later
+                                continue
+                            if cur and cur.get('shops') and cur['shops'].get(k):
+                                _dprint(f"[LOCAL] Reporting {k} after fresh snapshot.")
+                                _print_available(k, cur['shops'].get(k, {}))
+                                notifier.notify_restock(k, cur['shops'].get(k, {}))
+                                # mark as handled locally
+                                pending_print_kinds.discard(k)
+                        except Exception:
+                            pass
+
+            time.sleep(1.0)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(service_workers="allow")
+        page = ctx.new_page()
+        _dprint(f"[INIT] Opening room {ROOM_URL}")
+
+        client = ctx.new_cdp_session(page)
+        client.send("Network.enable")
+
+        def on_ws_frame(params):
+            """CDP handler: updates state, baselines timers, and prints/dispatches on Welcome."""
+            global full_state, last_normalized
+            try:
+                payload = params.get('response', {}).get('payloadData', '')
+                if not payload or not (payload.startswith('{') or payload.startswith('[')):
+                    return
+                obj = json.loads(payload)
+            except Exception:
+                return
+
+            t = obj.get('type')
+
+            if t == 'Welcome':
+                fs = obj.get('fullState') or {}
+                with state_lock:
+                    full_state = fs
+                    cur = normalize_shops(full_state)
+                    if not cur:
+                        return
+                    last_normalized = cur
+
+                    now = time.monotonic()
+                    for kind, s in cur.get('shops', {}).items():
+                        secs = s.get('secondsUntilRestock')
+                        if isinstance(secs, (int, float)):
+                            period = restock_timers.get(kind, {}).get('period', DEFAULT_PERIODS.get(kind, float(secs)))
+                            restock_timers[kind] = {'secs': float(secs), 't0': now, 'period': float(period)}
+
+                    # Capture snapshot in-memory but do not notify or write files.
+                    write_snapshot_if_changed(cur, reason="welcome")
+                    if pending_print_kinds:
+                        for kind in sorted(pending_print_kinds):
+                            _dprint(f"[WELCOME] Fresh snapshot received; printing {kind}.")
+                            _print_available(kind, cur['shops'].get(kind, {}))
+                            notifier.notify_restock(kind, cur['shops'].get(kind, {}))
+                        pending_print_kinds.clear()
+                return
+
+            if t == 'PartialState':
+                patches = obj.get('patches') or []
+                if not patches:
+                    return
+                with state_lock:
+                    full_state = apply_patches(full_state, patches)
+                    cur = normalize_shops(full_state)
+                    if not cur:
+                        return
+
+                    now = time.monotonic()
+                    for kind, s in cur.get('shops', {}).items():
+                        cur_secs = s.get('secondsUntilRestock')
+                        if isinstance(cur_secs, (int, float)):
+                            rt = restock_timers.get(kind)
+                            if not rt:
+                                restock_timers[kind] = {
+                                    'secs': float(cur_secs),
+                                    't0': now,
+                                    'period': DEFAULT_PERIODS.get(kind, float(cur_secs)),
+                                }
+                            else:
+                                prev_secs = float(rt['secs'])
+                                restock_timers[kind]['secs'] = float(cur_secs)
+                                restock_timers[kind]['t0'] = now
+                                if float(cur_secs) > prev_secs + 3:
+                                    restock_timers[kind]['period'] = float(cur_secs)
+                                    _dbg(f"{kind} period updated via server reset → {cur_secs}s")
+
+                    last_normalized = cur
+                    # Capture snapshot in-memory but do not notify or write files.
+                    write_snapshot_if_changed(cur, reason="partial")
+
+        client.on('Network.webSocketFrameReceived', on_ws_frame)
+
+        # Navigation + open SHOP
+        page.goto(ROOM_URL)
+        try:
+            page.get_by_role('button', name=re.compile(r"\bSHOP\b", re.I)).click(timeout=6000)
+        except Exception:
+            pass
+
+        # Start countdown printer
+        threading.Thread(target=countdown_loop, daemon=True).start()
+
+        # Wait for first snapshot (best effort)
+        deadline = time.time() + MAX_WAIT_SEC
+        while time.time() < deadline and not written_first_snapshot.is_set():
+            time.sleep(0.1)
+
+        _dprint("[MONITOR] Running. Press Ctrl+C to stop this process.")
+
+        # MONITOR MAIN LOOP (if you want refreshes, wire them here; currently local report only)
+        try:
+            while True:
+                # Handle refresh requests from the countdown thread (reload page in Playwright thread)
+                # Support both normal and forced refresh requests. Forced requests bypass cooldown.
+                if refresh_requested.is_set() or force_refresh_requested.is_set():
+                    forced = force_refresh_requested.is_set()
+                    now = time.time()
+                    try:
+                        with state_lock:
+                            can = (now - float(last_refresh_at)) >= MIN_REFRESH_COOLDOWN_SEC or forced
+                        if can:
+                            _dprint("[MONITOR] Refresh requested; reloading page." + (" (forced)" if forced else ""))
+                            try:
+                                page.reload()
+                            except Exception as e:
+                                _dprint(f"[MONITOR] Page reload failed: {e}")
+                            with state_lock:
+                                last_refresh_at = now
+                        else:
+                            _dprint("[MONITOR] Refresh requested but cooldown active.")
+                    finally:
+                        refresh_requested.clear()
+                        force_refresh_requested.clear()
+                 
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            browser.close()
+
+# ---------- Discord bot setup ----------
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+notifier = DiscordNotifier(client)
+monitor_thread: Optional[threading.Thread] = None
+tree = app_commands.CommandTree(client)
+
+# ---------- Watchlist UI (slash commands + components) ----------
+PAGE_SIZE = 25  # Discord max options per select
+
+def chunk(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
+
+# New UI: two dropdowns — one for kind, one for items (paginated)
+class KindSelect(discord.ui.Select):
+    def __init__(self, parent_view: "WatchlistView"):
+        self.parent_view = parent_view
+        kinds = ['all', 'seed', 'egg', 'tool', 'decor', 'other']
+        options = [
+            discord.SelectOption(label=k.title() if k != 'all' else 'All kinds', value=k, default=(k == parent_view.kind))
+            for k in kinds
+        ]
+        super().__init__(placeholder='Choose a kind…', min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.user_id:
+            await interaction.response.send_message("Only the command invoker can use this control.", ephemeral=True)
+            return
+        # set kind and reset page
+        self.parent_view.kind = self.values[0]
+        self.parent_view.page = 0
+        self.parent_view.update_components()
+        await interaction.response.edit_message(content=self.parent_view.render_header(), view=self.parent_view)
+
+class ItemSelect(discord.ui.Select):
+    def __init__(self, parent_view: "WatchlistView"):
+        self.parent_view = parent_view
+        page_items = parent_view._current_page_items()
+        options = [
+            discord.SelectOption(label=label, value=value, default=(value in parent_view.selection))
+            for (label, value, _r) in page_items
+        ]
+        placeholder = f"Select items — page {parent_view.page+1}/{max(parent_view.page_count(),1)}"
+        super().__init__(placeholder=placeholder, min_values=0, max_values=len(options) if options else 1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.user_id:
+            await interaction.response.send_message("Only the command invoker can use this control.", ephemeral=True)
+            return
+        page_values = {opt.value for opt in self.options}
+        chosen = set(self.values)
+        # Replace selections for this page with the user's current choices
+        self.parent_view.selection -= page_values
+        self.parent_view.selection |= chosen
+        # Persist selection immediately so it survives restarts
+        try:
+            set_guild_watch(self.parent_view.guild_id, list(self.parent_view.selection))
+        except Exception as e:
+            _dprint(f"[WARN] failed to persist watchlist for guild {self.parent_view.guild_id}: {e}")
+        self.parent_view.update_components()
+        await interaction.response.edit_message(content=self.parent_view.render_header(), view=self.parent_view)
+
+class WatchlistView(discord.ui.View):
+    def __init__(self, user_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.page = 0
+        self.kind = 'all'
+        # working selection starts from saved watchlist
+        self.selection: Set[str] = get_guild_watch(guild_id)
+        self.update_components()
+
+    def _items_for_kind(self):
+        if self.kind == 'all':
+            return ITEM_OPTIONS
+        return [(label, val, r) for (label, val, r) in ITEM_OPTIONS if _kind_for_name(val) == self.kind]
+
+    def page_count(self):
+        total = len(self._items_for_kind()) if self.kind != 'all' else sum(len(p['items']) for p in ITEM_PAGES)
+        if total == 0:
+            return 0
+        return (total + PAGE_SIZE - 1) // PAGE_SIZE
+
+    def _current_page_items(self):
+        items = self._items_for_kind()
+        start = self.page * PAGE_SIZE
+        return items[start:start + PAGE_SIZE]
+
+    def render_header(self) -> str:
+        total = len(self._items_for_kind()) if self.kind != 'all' else sum(len(p['items']) for p in ITEM_PAGES)
+        selected = len(self.selection)
+        kind_label = self.kind.title() if self.kind != 'all' else 'All'
+        pc = self.page_count() or 1
+        return f"Configure watchlist for this server (kind: {kind_label} — page {self.page+1}/{pc}):\nSelected **{selected}** of **{total}** items."
+
+    def update_components(self):
+        self.clear_items()
+        # Kind selector
+        self.add_item(KindSelect(self))
+        # Item selector for current page (if any items exist)
+        if self.page_count() > 0:
+            self.add_item(ItemSelect(self))
+
+        # Nav buttons
+        prev = discord.ui.Button(label="← Prev", style=discord.ButtonStyle.secondary, disabled=(self.page <= 0))
+        nextb = discord.ui.Button(label="Next →", style=discord.ButtonStyle.secondary, disabled=(self.page >= max(self.page_count()-1, 0)))
+        save = discord.ui.Button(label="Save", style=discord.ButtonStyle.success)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger)
+
+        async def on_prev(i: discord.Interaction):
+            if i.user.id != self.user_id:
+                await i.response.send_message("Only the command invoker can use this control.", ephemeral=True)
+                return
+            self.page = max(0, self.page-1)
+            self.update_components()
+            await i.response.edit_message(content=self.render_header(), view=self)
+
+        async def on_next(i: discord.Interaction):
+            if i.user.id != self.user_id:
+                await i.response.send_message("Only the command invoker can use this control.", ephemeral=True)
+                return
+            self.page = min(max(self.page_count()-1, 0), self.page+1)
+            self.update_components()
+            await i.response.edit_message(content=self.render_header(), view=self)
+
+        async def on_save(i: discord.Interaction):
+            if i.user.id != self.user_id:
+                await i.response.send_message("Only the command invoker can save.", ephemeral=True)
+                return
+            set_guild_watch(self.guild_id, list(self.selection))
+            names = [lbl for (lbl,val,_r) in ITEM_OPTIONS if val in self.selection][:20]
+            extra = "" if len(self.selection) <= 20 else f"\n...and {len(self.selection)-20} more"
+            await i.response.edit_message(content=f"✅ Saved **{len(self.selection)}** watched items for this server.\n" + ("\n".join(names) + extra if names else "No items selected."), view=None)
+
+        async def on_cancel(i: discord.Interaction):
+            if i.user.id != self.user_id:
+                await i.response.send_message("Only the command invoker can cancel.", ephemeral=True)
+                return
+            self.stop()
+            await i.response.edit_message(content="❌ Canceled. No changes saved.", view=None)
+
+        prev.callback = on_prev
+        nextb.callback = on_next
+        save.callback = on_save
+        cancel.callback = on_cancel
+
+        self.add_item(prev)
+        self.add_item(nextb)
+        self.add_item(save)
+        self.add_item(cancel)
+
+@tree.command(name="shop_watch", description="Choose which items to be notified about (checklist).")
+async def shop_watch(interaction: discord.Interaction):
+    if not ITEM_OPTIONS:
+        await interaction.response.send_message("No items found in item_rarities.json.", ephemeral=True)
+        return
+    view = WatchlistView(interaction.user.id, interaction.guild.id)
+    await interaction.response.send_message(view.render_header(), view=view, ephemeral=True)
+
+@tree.command(name="shop_watch_view", description="Show the current watchlist for this server.")
+async def shop_watch_view(interaction: discord.Interaction):
+    sel = list(get_guild_watch(interaction.guild.id))
+    if not sel:
+        await interaction.response.send_message("This server has **no watchlist** set. Use `/shop_watch` to configure.", ephemeral=True)
+        return
+    # Map back to pretty labels with rarity
+    labels = [lbl for (lbl,val,_r) in ITEM_OPTIONS if val in sel]
+    labels.sort()
+    preview = "\n".join(labels[:30])
+    extra = f"\n...and {len(labels)-30} more" if len(labels) > 30 else ""
+    await interaction.response.send_message(f"Watched items (**{len(labels)}**):\n{preview}{extra}", ephemeral=True)
+
+# ---------- Events ----------
+@client.event
+async def on_ready():
+    global monitor_thread
+    _dprint(f"[DISCORD] Logged in as {client.user} (id={client.user.id})")
+    # Load and report saved watchlist counts for visibility
+    try:
+        wl = load_watchlist()
+        total_guilds = len(wl)
+        total_items = sum(len(v) for v in wl.values())
+        _dprint(f"[WATCHLIST] Loaded watchlist for {total_guilds} guild(s), {total_items} total selections.")
+    except Exception:
+        pass
+    # Start monitor thread once
+    if monitor_thread is None or not monitor_thread.is_alive():
+        monitor_thread = threading.Thread(target=monitor_loop, args=(notifier,), daemon=True)
+        monitor_thread.start()
+
+    # Sync slash commands to each guild for fast availability
+    try:
+        for g in client.guilds:
+            await tree.sync(guild=g)
+        # Also do a global sync (optional, slower to propagate)
+        await tree.sync()
+        _dprint(f"[DISCORD] Slash commands synced to {len(client.guilds)} guild(s) + global.")
+    except Exception as e:
+        _dprint(f"[WARN] command sync failed: {e}")
+
+
+# Optional message commands you already had
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    cmd = message.content.strip().lower()
+
+    if cmd == '!shop_snapshot':
+        try:
+            await message.channel.send('Snapshot feature is disabled in this build.')
+        except Exception as e:
+            await message.channel.send(f'Failed to send snapshot: {e}')
+
+    elif cmd == '!shop_debug':
+        with state_lock:
+            if not restock_timers:
+                await message.channel.send("No timers yet.")
+                return
+            lines = []
+            now = time.monotonic()
+            for kind, rt in restock_timers.items():
+                remain = float(rt['secs']) - (now - float(rt['t0']))
+                period = rt.get('period')
+                lines.append(f"{kind}: remain={_fmt_secs(remain)} period={int(period) if period else 'N/A'}s")
+            await message.channel.send("```\n" + "\n".join(lines) + "\n```")
+
+# ---------- Run ----------
+if __name__ == '__main__':
+    if not DISCORD_TOKEN:
+        print('Missing DISCORD_TOKEN in environment/.env')
+        raise SystemExit(1)
+    client.run(DISCORD_TOKEN)

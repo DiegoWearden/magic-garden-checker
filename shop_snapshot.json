@@ -1,0 +1,390 @@
+{
+  "captured_at": 1758145205,
+  "currentTime": 1758145203671,
+  "shops": {
+    "seed": {
+      "secondsUntilRestock": 297,
+      "inventory": [
+        {
+          "id": "Carrot",
+          "name": "Carrot",
+          "itemType": "Seed",
+          "initialStock": 21,
+          "currentStock": 21
+        },
+        {
+          "id": "Strawberry",
+          "name": "Strawberry",
+          "itemType": "Seed",
+          "initialStock": 2,
+          "currentStock": 2
+        },
+        {
+          "id": "Aloe",
+          "name": "Aloe",
+          "itemType": "Seed",
+          "initialStock": 7,
+          "currentStock": 7
+        },
+        {
+          "id": "Blueberry",
+          "name": "Blueberry",
+          "itemType": "Seed",
+          "initialStock": 1,
+          "currentStock": 1
+        },
+        {
+          "id": "Apple",
+          "name": "Apple",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "OrangeTulip",
+          "name": "OrangeTulip",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Tomato",
+          "name": "Tomato",
+          "itemType": "Seed",
+          "initialStock": 3,
+          "currentStock": 3
+        },
+        {
+          "id": "Daffodil",
+          "name": "Daffodil",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Corn",
+          "name": "Corn",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Watermelon",
+          "name": "Watermelon",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Pumpkin",
+          "name": "Pumpkin",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Echeveria",
+          "name": "Echeveria",
+          "itemType": "Seed",
+          "initialStock": 2,
+          "currentStock": 2
+        },
+        {
+          "id": "Coconut",
+          "name": "Coconut",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Banana",
+          "name": "Banana",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Lily",
+          "name": "Lily",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "BurrosTail",
+          "name": "BurrosTail",
+          "itemType": "Seed",
+          "initialStock": 2,
+          "currentStock": 2
+        },
+        {
+          "id": "Mushroom",
+          "name": "Mushroom",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Cactus",
+          "name": "Cactus",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Bamboo",
+          "name": "Bamboo",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Grape",
+          "name": "Grape",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Pepper",
+          "name": "Pepper",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Lemon",
+          "name": "Lemon",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "PassionFruit",
+          "name": "PassionFruit",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "DragonFruit",
+          "name": "DragonFruit",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Lychee",
+          "name": "Lychee",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Sunflower",
+          "name": "Sunflower",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "Starweaver",
+          "name": "Starweaver",
+          "itemType": "Seed",
+          "initialStock": 0,
+          "currentStock": 0
+        }
+      ]
+    },
+    "egg": {
+      "secondsUntilRestock": 297,
+      "inventory": [
+        {
+          "id": "CommonEgg",
+          "name": "CommonEgg",
+          "itemType": "Egg",
+          "initialStock": 1,
+          "currentStock": 1
+        },
+        {
+          "id": "UncommonEgg",
+          "name": "UncommonEgg",
+          "itemType": "Egg",
+          "initialStock": 1,
+          "currentStock": 1
+        },
+        {
+          "id": "RareEgg",
+          "name": "RareEgg",
+          "itemType": "Egg",
+          "initialStock": 1,
+          "currentStock": 1
+        },
+        {
+          "id": "LegendaryEgg",
+          "name": "LegendaryEgg",
+          "itemType": "Egg",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "MythicalEgg",
+          "name": "MythicalEgg",
+          "itemType": "Egg",
+          "initialStock": 0,
+          "currentStock": 0
+        }
+      ]
+    },
+    "tool": {
+      "secondsUntilRestock": 597,
+      "inventory": [
+        {
+          "id": "WateringCan",
+          "name": "WateringCan",
+          "itemType": "Tool",
+          "initialStock": 3,
+          "currentStock": 3
+        },
+        {
+          "id": "PlanterPot",
+          "name": "PlanterPot",
+          "itemType": "Tool",
+          "initialStock": 5,
+          "currentStock": 5
+        },
+        {
+          "id": "Shovel",
+          "name": "Shovel",
+          "itemType": "Tool",
+          "initialStock": 1,
+          "currentStock": 1
+        }
+      ]
+    },
+    "decor": {
+      "secondsUntilRestock": 1197,
+      "inventory": [
+        {
+          "id": "SmallRock",
+          "name": "SmallRock",
+          "itemType": "Decor",
+          "initialStock": 5,
+          "currentStock": 5
+        },
+        {
+          "id": "MediumRock",
+          "name": "MediumRock",
+          "itemType": "Decor",
+          "initialStock": 3,
+          "currentStock": 3
+        },
+        {
+          "id": "LargeRock",
+          "name": "LargeRock",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "WoodBench",
+          "name": "WoodBench",
+          "itemType": "Decor",
+          "initialStock": 2,
+          "currentStock": 2
+        },
+        {
+          "id": "WoodArch",
+          "name": "WoodArch",
+          "itemType": "Decor",
+          "initialStock": 2,
+          "currentStock": 2
+        },
+        {
+          "id": "WoodBridge",
+          "name": "WoodBridge",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "WoodLampPost",
+          "name": "WoodLampPost",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "WoodOwl",
+          "name": "WoodOwl",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "StoneBench",
+          "name": "StoneBench",
+          "itemType": "Decor",
+          "initialStock": 2,
+          "currentStock": 2
+        },
+        {
+          "id": "StoneArch",
+          "name": "StoneArch",
+          "itemType": "Decor",
+          "initialStock": 2,
+          "currentStock": 2
+        },
+        {
+          "id": "StoneBridge",
+          "name": "StoneBridge",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "StoneLampPost",
+          "name": "StoneLampPost",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "StoneGnome",
+          "name": "StoneGnome",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "MarbleBench",
+          "name": "MarbleBench",
+          "itemType": "Decor",
+          "initialStock": 1,
+          "currentStock": 1
+        },
+        {
+          "id": "MarbleArch",
+          "name": "MarbleArch",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "MarbleBridge",
+          "name": "MarbleBridge",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        },
+        {
+          "id": "MarbleLampPost",
+          "name": "MarbleLampPost",
+          "itemType": "Decor",
+          "initialStock": 0,
+          "currentStock": 0
+        }
+      ]
+    }
+  }
+}
