@@ -1074,6 +1074,27 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
 
+@client.event
+async def on_ready():
+    """Start background monitor thread once the Discord client is ready."""
+    global monitor_thread
+    try:
+        _dprint(f"[BOT] Logged in as {client.user} (id={client.user.id})")
+    except Exception:
+        _dprint("[BOT] Logged in (client.user not available)")
+    # Ensure application commands are synced so slash commands are available
+    try:
+        await tree.sync()
+        _dprint("[BOT] Slash commands synced.")
+    except Exception as e:
+        _dprint(f"[WARN] Failed to sync slash commands: {e}")
+
+    # Start monitor thread if not already running
+    if monitor_thread is None:
+        monitor_thread = threading.Thread(target=monitor_loop, args=(notifier,), daemon=True)
+        monitor_thread.start()
+        _dprint("[BOT] Monitor thread started.")
+
 # ---------- Run ----------
 if __name__ == '__main__':
     if not DISCORD_TOKEN:
