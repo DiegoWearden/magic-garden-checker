@@ -1,280 +1,301 @@
-#!/usr/bin/env python3
-# Simple editor server for item_rarities.json — no external dependencies
-import json, os, urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+# rarity_gui.py
+import os
+import json
+import argparse
 from pathlib import Path
-import sys
+from collections import OrderedDict
+from flask import Flask, request, redirect, url_for, render_template_string
 
-ROOT = Path(__file__).resolve().parent
-ITEM_PATH = ROOT / 'item_rarities.json'
-# Port can be provided as first CLI arg or via RARITY_EDITOR_PORT env var; default 8000
-DEFAULT_PORT = int(os.getenv('RARITY_EDITOR_PORT', '8000'))
-try:
-    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
-except Exception:
-    PORT = DEFAULT_PORT
+# --- CLI / config ---
+parser = argparse.ArgumentParser(description="Web GUI to tag rarities for items in a JSON file.")
+parser.add_argument("--input", "-i", default=os.getenv("INPUT_FILE", "discovered_items.json"),
+                    help="Path to the discovered-items JSON (default: discovered_items.json)")
+parser.add_argument("--output", "-o", default=os.getenv("OUTPUT_FILE", "item_rarities.json"),
+                    help="Path to write the rarity mapping JSON (default: item_rarities.json)")
+parser.add_argument("--port", "-p", type=int, default=int(os.getenv("PORT", "5000")),
+                    help="Port to run the server on (default: 5000)")
+args = parser.parse_args()
 
-HTML = '''<!doctype html>
-<html>
+INPUT_FILE = Path(args.input)
+OUTPUT_FILE = Path(args.output)
+
+RARITIES = ["common", "uncommon", "rare", "legendary", "mythic", "divine", "celestial"]
+
+app = Flask(__name__)
+
+# --- helpers ---
+def load_discovered() -> OrderedDict:
+    if not INPUT_FILE.exists():
+        raise FileNotFoundError(f"Input file not found: {INPUT_FILE.resolve()}")
+    with INPUT_FILE.open("r", encoding="utf-8") as f:
+        data = json.load(f, object_pairs_hook=OrderedDict)
+    normalized = OrderedDict()
+    for kind, items in data.items():
+        if isinstance(items, list):
+            normalized[kind] = [str(x) for x in items]
+    return normalized
+
+def load_existing_mapping() -> dict:
+    if not OUTPUT_FILE.exists():
+        return {}
+    try:
+        with OUTPUT_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def build_default_mapping(discovered: OrderedDict, existing: dict) -> OrderedDict:
+    out = OrderedDict()
+    for kind, items in discovered.items():
+        out[kind] = OrderedDict()
+        existing_kind = existing.get(kind, {})
+        for item in items:
+            val = existing_kind.get(item)
+            out[kind][item] = val if val in RARITIES else None
+    return out
+
+# --- routes ---
+@app.route("/", methods=["GET"])
+def index():
+    discovered = load_discovered()
+    existing = load_existing_mapping()
+    mapping = build_default_mapping(discovered, existing)
+
+    saved = request.args.get("saved")
+    missing = request.args.get("missing")
+    message = None
+    if saved is not None:
+        if missing and missing.isdigit() and int(missing) > 0:
+            message = f"Saved to {OUTPUT_FILE.name}. {missing} item(s) still unassigned."
+        else:
+            message = f"Saved to {OUTPUT_FILE.name}. All items assigned! 🎉"
+
+    return render_template_string(
+        TEMPLATE,
+        discovered=discovered,
+        mapping=mapping,
+        rarities=RARITIES,
+        message=message,
+        output_filename=str(OUTPUT_FILE.name),
+        total_items=sum(len(v) for v in discovered.values())
+    )
+
+@app.route("/save", methods=["POST"])
+def save():
+    discovered = load_discovered()
+
+    # Gather selections. Each item has checkbox group named "rarity::<kind>::<item>"
+    selections = {}
+    for kind, items in discovered.items():
+        for item in items:
+            key = f"rarity::{kind}::{item}"
+            vals = request.form.getlist(key)
+            # Fallback for any old template version that used "rarity::<item>"
+            if not vals:
+                vals = request.form.getlist(f"rarity::{item}")
+            rarity = vals[-1].strip().lower() if vals else None
+            if rarity in RARITIES:
+                selections[(kind, item)] = rarity
+
+    # Reassemble grouped mapping; unselected items saved as null
+    out = OrderedDict()
+    missing = 0
+    for kind, items in discovered.items():
+        out[kind] = OrderedDict()
+        for item in items:
+            rarity = selections.get((kind, item))
+            if rarity:
+                out[kind][item] = rarity
+            else:
+                out[kind][item] = None
+                missing += 1
+
+    with OUTPUT_FILE.open("w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+
+    return redirect(url_for("index", saved=1, missing=missing))
+
+# --- inline template (single form + unique checkbox IDs) ---
+TEMPLATE = r"""
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Item Rarities Editor</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="utf-8"/>
+  <title>Item Rarity Tagger</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body{font-family:system-ui,Segoe UI,Arial;margin:16px}
-    .section{margin-bottom:20px}
-    .item{display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid #eee}
-    .item .name{flex:1}
-    .radios{display:flex;gap:8px;align-items:center}
-    label{font-size:13px}
-    .controls{margin:8px 0 16px}
-    .small{font-size:13px;color:#666}
-    .add-row{display:flex;gap:8px;margin-top:8px}
-    .cat-select{width:140px}
+    :root { --pad: 12px; --radius: 10px; --border:#e2e2e2; --muted:#666; --bg:#fafafa; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: white; color: #222; }
+    header { position: sticky; top: 0; background: white; border-bottom: 1px solid var(--border); padding: var(--pad); z-index: 10; display:flex; gap:12px; align-items:center; }
+    h1 { font-size: 18px; margin: 0 8px 0 0; }
+    .pill { font-size: 12px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--muted); }
+    .bar { flex: 1; display:flex; gap:8px; }
+    input[type="search"] { flex:1; padding:10px; border:1px solid var(--border); border-radius:8px; font-size:14px; }
+    button { padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:white; cursor:pointer; font-size:14px; }
+    button.primary { background:#111; color:white; border-color:#111; }
+    main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+    .msg { margin: 12px 0 0 0; padding: 10px 12px; border:1px solid var(--border); border-radius:8px; background: #f4fff4; }
+    details { border:1px solid var(--border); border-radius:12px; margin: 16px 0; background: var(--bg); }
+    summary { list-style:none; padding: 12px 14px; font-weight:600; cursor:pointer; display:flex; align-items:center; gap:10px; }
+    .count { font-weight:400; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; background:white; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th { text-align:left; font-size:12px; color: var(--muted); background:#fcfcfc; position: sticky; top: 56px; z-index: 5; }
+    .row.unassigned { background: #fff8e1; }
+    .checks { display:flex; flex-wrap: wrap; gap: 8px; align-items:center; }
+    .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--border); border-radius:999px; padding:6px 10px; cursor:pointer; user-select:none; }
+    .chip .box { width:16px; height:16px; border:1px solid var(--border); border-radius:4px; display:inline-block; }
+    input[type="checkbox"] { display:none; }
+    input[type="checkbox"]:checked + label.chip { border-color:#111; background:#111; color:white; }
+    input[type="checkbox"]:checked + label.chip .box { background:white; border-color:white; position:relative; }
+    input[type="checkbox"]:checked + label.chip .box::after {
+      content: ""; position:absolute; left:4px; top:1px; width:5px; height:9px; border-right:2px solid #111; border-bottom:2px solid #111; transform: rotate(45deg);
+      background:transparent;
+    }
+    .muted { color: var(--muted); font-size: 12px; }
+    .controls { display:flex; gap:8px; align-items:center; padding: 0 12px 12px 12px; flex-wrap:wrap; }
+    .controls .chip { padding:4px 8px; }
+    .clear-btn { font-size:12px; border-style:dashed; }
+    .footer { display:flex; justify-content:space-between; align-items:center; margin-top:12px; }
+    @media (max-width: 720px) { th:nth-child(2), td:nth-child(2) { display:none; } }
   </style>
 </head>
 <body>
-  <h2>Item Rarities Editor</h2>
-  <div class="controls">
-    <button id="load">Load</button>
-    <button id="save">Save</button>
-    <button id="download">Download JSON</button>
-    <input id="filein" type="file" style="display:none">
-    <button id="upload">Upload JSON</button>
-    <span id="msg" style="margin-left:10px;color:green"></span>
+
+<header>
+  <h1>Item Rarity Tagger</h1>
+  <span class="pill">{{ total_items }} item{{ '' if total_items == 1 else 's' }}</span>
+  <div class="bar">
+    <input id="search" type="search" placeholder="Search items (e.g., 'carrot', 'bench', 'egg')…"/>
   </div>
+  <!-- This button submits the ONE main form below -->
+  <button class="primary" type="submit" form="rarity-form">Save</button>
+</header>
 
-  <div id="editor">
-    <div class="section" id="seeds">
-      <h3>Seeds</h3>
-      <div class="small">Choose one rarity per item.</div>
-      <div class="list"></div>
+<main>
+  {% if message %}
+  <div class="msg">{{ message }}</div>
+  {% endif %}
+
+  <!-- ONE single form around everything that needs submitting -->
+  <form id="rarity-form" method="post" action="{{ url_for('save') }}">
+    <p class="muted">
+      Click a rarity chip to “check” it for an item. Click the same chip again to clear. Saving writes <strong>{{ output_filename }}</strong>.
+    </p>
+
+    {% for kind, items in discovered.items() %}
+    <details open>
+      <summary>
+        {{ kind }} <span class="count">({{ items|length }})</span>
+      </summary>
+
+      <div class="controls">
+        <span class="muted">Bulk apply to all in <strong>{{ kind }}</strong>:</span>
+        {% for r in rarities %}
+          <button type="button" class="chip" data-bulk="{{ r }}" data-kind="{{ kind }}">{{ r }}</button>
+        {% endfor %}
+        <button type="button" class="clear-btn" data-bulk="__clear__" data-kind="{{ kind }}">Clear all</button>
+        <span class="muted" style="margin-left:auto;">Tip: use the search box to filter.</span>
+      </div>
+
+      <table data-kind="{{ kind }}">
+        <thead>
+          <tr>
+            <th style="width: 40%;">Item</th>
+            <th style="width: 30%;">Kind</th>
+            <th style="width: 30%;">Rarity</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in items %}
+          {% set current = mapping[kind][item] %}
+          {% set item_slug = (kind ~ '-' ~ item)|replace(' ', '_')|replace('/', '_')|replace('\\', '_')|replace('"','')|replace("'", '')|lower %}
+          <tr class="row {% if not current %}unassigned{% endif %}" data-kind="{{ kind }}" data-item="{{ item|e }}">
+            <td><label><strong>{{ item }}</strong></label></td>
+            <td class="muted">{{ kind }}</td>
+            <td>
+              <div class="checks">
+                {% for r in rarities %}
+                  {% set cid = 'cb-' ~ item_slug ~ '-' ~ r %}
+                  <input type="checkbox" id="{{ cid }}" name="rarity::{{ kind }}::{{ item }}" value="{{ r }}" {% if current == r %}checked{% endif %}>
+                  <label class="chip" for="{{ cid }}"><span class="box"></span>{{ r }}</label>
+                {% endfor %}
+                <button type="button" class="clear-btn" data-clear="{{ kind }}::{{ item }}">Clear</button>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+    {% endfor %}
+
+    <div class="footer">
+      <button class="primary" type="submit">Save</button>
+      <span class="muted">Unassigned items save as <code>null</code>.</span>
     </div>
-    <div class="section" id="eggs">
-      <h3>Eggs</h3>
-      <div class="list"></div>
-    </div>
-    <div class="section" id="tools">
-      <h3>Tools</h3>
-      <div class="list"></div>
-    </div>
-    <div class="section" id="decor">
-      <h3>Decor</h3>
-      <div class="list"></div>
-    </div>
+  </form>
+</main>
 
-    <div class="add-row">
-      <input id="new-name" placeholder="New item id or display name" style="flex:1">
-      <select id="new-cat" class="cat-select"><option value="seed">Seed</option><option value="egg">Egg</option><option value="tool">Tool</option><option value="decor">Decor</option></select>
-      <button id="add-new">Add</button>
-    </div>
-  </div>
+<script>
+  // Search filter
+  const search = document.getElementById('search');
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    document.querySelectorAll('tbody tr.row').forEach(tr => {
+      const item = tr.dataset.item.toLowerCase();
+      const kind = tr.dataset.kind.toLowerCase();
+      tr.style.display = (item.includes(q) || kind.includes(q)) ? '' : 'none';
+    });
+  });
 
-  <script>
-    // rarities and canonical item lists (keeps GUI aligned with shop_snapshot)
-    const RARITIES = ['common','uncommon','rare','epic','legendary','mythic','divine','celestial'];
-    const SEEDS = [
-      "Carrot Seed","Strawberry Seed","Aloe Seed","Blueberry Seed","Apple Seed","Tulip Seed",
-      "Tomato Seed","Daffodil Seed","Corn Kernel","Watermelon Seed","Pumpkin Seed",
-      "Echeveria Cutting","Coconut Seed","Banana Seed","Lily Seed","Burro's Tail Cutting",
-      "Mushroom Spore","Cactus Seed","Bamboo Seed","Grape Seed","Pepper Seed","Lemon Seed",
-      "Passion Fruit Seed","Dragon Fruit Seed","Lychee Pit","Sunflower Seed","Starweaver Pod"
-    ];
-    const EGGS = [
-      "Common Egg","Uncommon Egg","Rare Egg","Legendary Egg","Mythical Egg"
-    ];
-    const TOOLS = ["Watering Can","Planter Pot","Shovel"];
-    const DECOR = [
-      "Small Rock","Medium Rock","Large Rock","Wood Bench","Wood Arch","Wood Bridge","Wood Lamp Post","Wood Owl",
-      "Stone Bench","Stone Arch","Stone Bridge","Stone Lamp Post","Stone Gnome",
-      "Marble Bench","Marble Arch","Marble Bridge","Marble Lamp Post"
-    ];
+  // Enforce single selection per row (checkbox look, radio behavior)
+  document.querySelectorAll('.checks').forEach(group => {
+    group.addEventListener('change', (e) => {
+      if (e.target.matches('input[type="checkbox"]')) {
+        if (e.target.checked) {
+          group.querySelectorAll('input[type="checkbox"]').forEach(cb => { if (cb !== e.target) cb.checked = false; });
+        }
+        const tr = group.closest('tr');
+        const anyChecked = group.querySelector('input[type="checkbox"]:checked');
+        tr.classList.toggle('unassigned', !anyChecked);
+      }
+    });
+  });
 
-    // helper: normalize keys as the bot expects
-    function norm(k){ return (k||'').toString().trim().toLowerCase(); }
+  // Per-item clear
+  document.querySelectorAll('button[data-clear]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const group = btn.closest('.checks');
+      group.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
+      btn.closest('tr').classList.add('unassigned');
+    });
+  });
 
-    // render a single item row into container; radio inputs named by category+index
-    function renderItem(container, category, key, selected){
-      const idx = container.children.length;
-      const div = document.createElement('div'); div.className='item';
-      const name = document.createElement('div'); name.className='name'; name.textContent = key; div.appendChild(name);
-      const radios = document.createElement('div'); radios.className='radios';
-      RARITIES.forEach(r=>{
-        const id = `r_${category}_${idx}_${r}`;
-        const lab = document.createElement('label');
-        const inp = document.createElement('input'); inp.type='radio'; inp.name = `rar_${category}_${key}`; inp.value = r; inp.id = id;
-        if(selected === r) inp.checked = true;
-        lab.appendChild(inp); lab.appendChild(document.createTextNode(' ' + r));
-        radios.appendChild(lab);
-      });
-      div.appendChild(radios);
-      const del = document.createElement('button'); del.textContent='Delete'; del.onclick=()=>div.remove(); del.style.marginLeft='8px';
-      div.appendChild(del);
-      container.appendChild(div);
-    }
-
-    async function load(){
-      try{
-        const r = await fetch('/api/load');
-        const data = r.ok ? await r.json() : {};
-        document.getElementById('msg').textContent='Loaded'; document.getElementById('msg').style.color='green';
-        // clear lists
-        document.querySelector('#seeds .list').innerHTML='';
-        document.querySelector('#eggs .list').innerHTML='';
-        document.querySelector('#tools .list').innerHTML='';
-        document.querySelector('#decor .list').innerHTML='';
-        // helper to get rarity from loaded data, default 'common'
-        const getR = (name) => (data[norm(name)] || data[name.toLowerCase()] || 'common');
-        // render canonical lists
-        SEEDS.forEach(s => renderItem(document.querySelector('#seeds .list'), 'seed', s, getR(s)));
-        EGGS.forEach(e => renderItem(document.querySelector('#eggs .list'), 'egg', e, getR(e)));
-        TOOLS.forEach(t => renderItem(document.querySelector('#tools .list'), 'tool', t, getR(t)));
-        DECOR.forEach(d => renderItem(document.querySelector('#decor .list'), 'decor', d, getR(d)));
-        // render any extra keys present in data that weren't in canonical lists
-        const seen = new Set();
-        [...SEEDS, ...EGGS, ...TOOLS, ...DECOR].forEach(x=>seen.add(norm(x)));
-        Object.keys(data).forEach(k => {
-          if(seen.has(k)) return;
-          const raw = k; const val = data[k];
-          // attempt to categorize by substring
-          if(k.includes('egg')) renderItem(document.querySelector('#eggs .list'), 'egg', raw, val);
-          else if(k.includes('can') || k.includes('shovel') || k.includes('pot') || k.includes('tool')) renderItem(document.querySelector('#tools .list'), 'tool', raw, val);
-          else if(k.includes('seed')) renderItem(document.querySelector('#seeds .list'), 'seed', raw, val);
-          else renderItem(document.querySelector('#decor .list'), 'decor', raw, val);
-        });
-      }catch(e){ document.getElementById('msg').textContent='Load failed'; document.getElementById('msg').style.color='red'; }
-    }
-
-    function collect(){
-      const out = {};
-      ['seeds','eggs','tools','decor'].forEach(sec => {
-        const ct = document.querySelector(`#${sec} .list`);
-        if(!ct) return;
-        for(const child of ct.children){
-          const name = child.querySelector('.name').textContent.trim();
-          const radios = child.querySelectorAll('input[type=radio]');
-          let chosen = null;
-          radios.forEach(r=>{ if(r.checked) chosen = r.value; });
-          if(!chosen) chosen = 'common';
-          out[norm(name)] = chosen; // normalized key
+  // Bulk apply within a kind
+  document.querySelectorAll('button[data-bulk]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const kind = btn.getAttribute('data-kind');
+      const val = btn.getAttribute('data-bulk');
+      document.querySelectorAll(`table[data-kind="${CSS.escape(kind)}"] tbody tr`).forEach(tr => {
+        const group = tr.querySelector('.checks');
+        if (val === '__clear__') {
+          group.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
+          tr.classList.add('unassigned');
+        } else {
+          group.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = (cb.value === val));
+          tr.classList.remove('unassigned');
         }
       });
-      return out;
-    }
+    });
+  });
+</script>
 
-    document.getElementById('save').onclick = async ()=>{
-      const obj = collect();
-      try{
-        const r = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj)});
-        if(!r.ok) throw new Error('save failed');
-        document.getElementById('msg').textContent='Saved'; document.getElementById('msg').style.color='green';
-      }catch(e){ document.getElementById('msg').textContent='Save failed'; document.getElementById('msg').style.color='red'; }
-    };
-
-    document.getElementById('download').onclick = ()=>{
-      const blob = new Blob([JSON.stringify(collect(), null, 2)], {type:'application/json'});
-      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href=url; a.download='item_rarities.json'; a.click(); URL.revokeObjectURL(url);
-    };
-
-    document.getElementById('upload').onclick = ()=> document.getElementById('filein').click();
-    document.getElementById('filein').onchange = async (ev)=>{
-      const f = ev.target.files[0]; if(!f) return; const txt = await f.text();
-      try{ const obj = JSON.parse(txt); // write to server directly
-        const r = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj)});
-        if(r.ok){ await load(); document.getElementById('msg').textContent='Uploaded and loaded'; document.getElementById('msg').style.color='green'; }
-        else { document.getElementById('msg').textContent='Upload failed'; document.getElementById('msg').style.color='red'; }
-      }catch(e){ document.getElementById('msg').textContent='Invalid JSON'; document.getElementById('msg').style.color='red'; }
-    };
-
-    document.getElementById('add-new').onclick = ()=>{
-      const name = document.getElementById('new-name').value.trim();
-      const cat = document.getElementById('new-cat').value;
-      if(!name) return;
-      const mapping = { 'seed':'#seeds .list', 'egg':'#eggs .list', 'tool':'#tools .list', 'decor':'#decor .list' };
-      renderItem(document.querySelector(mapping[cat]), cat, name, 'common');
-      document.getElementById('new-name').value='';
-    };
-
-    // auto-load
-    window.addEventListener('load', ()=>load());
-  </script>
 </body>
 </html>
-'''
+"""
 
-class Handler(BaseHTTPRequestHandler):
-    def _set_cors(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._set_cors()
-        self.end_headers()
-
-    def do_GET(self):
-        if self.path in ('/', '/editor'):
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self._set_cors()
-            self.end_headers()
-            self.wfile.write(HTML.encode('utf-8'))
-            return
-        if self.path == '/api/load':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self._set_cors()
-            self.end_headers()
-            if ITEM_PATH.exists():
-                try:
-                    data = json.loads(ITEM_PATH.read_text(encoding='utf-8') or '{}')
-                except Exception:
-                    data = {}
-            else:
-                data = {}
-            self.wfile.write(json.dumps(data, indent=2).encode('utf-8'))
-            return
-        self.send_response(404); self.end_headers()
-
-    def do_POST(self):
-        if self.path == '/api/save':
-            length = int(self.headers.get('Content-Length') or 0)
-            body = self.rfile.read(length) if length else b''
-            try:
-                obj = json.loads(body.decode('utf-8') or '{}')
-                # normalize keys to lower-case strings
-                norm = {str(k).lower(): str(v).lower() for k,v in (obj.items() if isinstance(obj, dict) else [])}
-                with open(ITEM_PATH, 'w', encoding='utf-8') as f:
-                    json.dump(norm, f, indent=2, sort_keys=True)
-                self.send_response(200)
-                self._set_cors()
-                self.end_headers()
-                self.wfile.write(b'Saved')
-            except Exception as e:
-                self.send_response(400)
-                self._set_cors()
-                self.end_headers()
-                self.wfile.write(str(e).encode('utf-8'))
-            return
-        self.send_response(404); self.end_headers()
-
-if __name__ == '__main__':
-    print(f"Starting editor at http://127.0.0.1:{PORT}/editor")
-    # ensure file exists
-    if not ITEM_PATH.exists():
-        try:
-            ITEM_PATH.write_text('{}', encoding='utf-8')
-        except Exception:
-            pass
-    try:
-        server = HTTPServer(('127.0.0.1', PORT), Handler)
-    except OSError as e:
-        print(f"Failed to bind to 127.0.0.1:{PORT}: {e}")
-        print("Port already in use. Stop the process using that port or run this script with a different port:\n  python rarity_editor.py 8080\nOr set RARITY_EDITOR_PORT environment variable before running.")
-        raise SystemExit(1)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print('Shutting down')
-        server.server_close()
+if __name__ == "__main__":
+    print(f"Input:  {INPUT_FILE.resolve()}")
+    print(f"Output: {OUTPUT_FILE.resolve()}")
+    app.run(host="127.0.0.1", port=args.port, debug=False)
