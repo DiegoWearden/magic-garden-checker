@@ -146,3 +146,6 @@ cython_debug/
 .DS_Store
 
 guild_watchlist.json
+
+.playwright-browsers
+.ms-playwright
