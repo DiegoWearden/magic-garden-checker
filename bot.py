@@ -39,6 +39,9 @@ LOCAL_SOFT_RESET_AT_ZERO = True
 MAX_WAIT_SEC = 60
 MIN_REFRESH_COOLDOWN_SEC = 8.0
 
+# Auto-reload interval for item files
+FILE_WATCH_INTERVAL_SEC = float(os.getenv('FILE_WATCH_INTERVAL_SEC', '2.0'))
+
 # ---------- State (shared across threads; guard with state_lock) ----------
 state_lock = threading.Lock()
 
@@ -102,6 +105,10 @@ CANON_MAP: Dict[str, str] = {}        # alias squished -> canonical_key (for mat
 ITEM_OPTIONS: List[Tuple[str, str, str]] = []  # (label, value, rarity) for watchlist UI
 RARITIES_SET = {"common","uncommon","rare","legendary","mythic","divine","celestial"}
 ALIAS_MAP: Dict[str, str] = {}        # canonical_key -> custom display override
+
+# Track file mtimes to support auto-reload
+_rarities_mtime: Optional[float] = None
+_aliases_mtime: Optional[float] = None
 
 def _add_alias(canon: str, alias_text: str):
     CANON_MAP[_sk(alias_text)] = canon
@@ -199,6 +206,57 @@ def _load_aliases():
         _dprint(f"[ALIASES] Failed to load {ITEM_ALIASES_PATH.name}: {e}")
     finally:
         _rebuild_item_options()
+
+def _get_mtime(p: Path) -> Optional[float]:
+    try:
+        return p.stat().st_mtime
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+def _reload_aliases_if_changed() -> bool:
+    global _aliases_mtime
+    cur = _get_mtime(ITEM_ALIASES_PATH)
+    if cur != _aliases_mtime:
+        _load_aliases()
+        _aliases_mtime = cur
+        return True
+    return False
+
+def _reload_items_if_changed() -> bool:
+    global _rarities_mtime
+    cur = _get_mtime(ITEM_RARITIES_PATH)
+    if cur != _rarities_mtime:
+        _load_items()
+        # Re-apply aliases overlay after items load
+        _reload_aliases_if_changed()
+        _rarities_mtime = cur
+        return True
+    return False
+
+def start_items_file_watcher():
+    """Start a background thread that reloads items/aliases when files change."""
+    def loop():
+        global _rarities_mtime, _aliases_mtime
+        # Initialize mtimes
+        _rarities_mtime = _get_mtime(ITEM_RARITIES_PATH)
+        _aliases_mtime = _get_mtime(ITEM_ALIASES_PATH)
+        while True:
+            try:
+                changed_items = _reload_items_if_changed()
+                changed_alias = _reload_aliases_if_changed() if not changed_items else False
+                if changed_items or changed_alias:
+                    which = []
+                    if changed_items: which.append('items')
+                    if changed_alias: which.append('aliases')
+                    _dprint(f"[HOT-RELOAD] Updated {', '.join(which)} from disk.")
+            except Exception as e:
+                _dprint(f"[HOT-RELOAD] Error while checking files: {e}")
+            finally:
+                time.sleep(max(0.2, FILE_WATCH_INTERVAL_SEC))
+    t = threading.Thread(target=loop, name='items_file_watcher', daemon=True)
+    t.start()
 
 def _canonical_key_for_name(name: Optional[str]) -> Optional[str]:
     if not name: return None
@@ -680,6 +738,8 @@ def monitor_loop(notifier: DiscordNotifier):
             pass
 
         threading.Thread(target=countdown_loop, daemon=True).start()
+        # Start file watcher for hot-reload of items/aliases
+        start_items_file_watcher()
 
         # Wait for first normalized state
         deadline = time.time() + MAX_WAIT_SEC
