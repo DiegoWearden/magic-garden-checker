@@ -1,4 +1,13 @@
 {
+  "__rarities": [
+    "common",
+    "uncommon",
+    "rare",
+    "legendary",
+    "mythic",
+    "divine",
+    "celestial"
+  ],
   "seed": {
     "Carrot": "common",
     "Strawberry": "common",

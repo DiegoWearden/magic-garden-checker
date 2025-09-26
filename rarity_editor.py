@@ -19,7 +19,7 @@ args = parser.parse_args()
 INPUT_FILE = Path(args.input)
 OUTPUT_FILE = Path(args.output)
 
-RARITIES = ["common", "uncommon", "rare", "legendary", "mythic", "divine", "celestial"]
+DEFAULT_RARITIES = ["common", "uncommon", "rare", "legendary", "mythic", "divine", "celestial"]
 
 app = Flask(__name__)
 
@@ -44,14 +44,50 @@ def load_existing_mapping() -> dict:
     except Exception:
         return {}
 
+def load_rarities() -> list:
+    """Read rarities list from OUTPUT_FILE top-level key '__rarities' if present; else defaults."""
+    try:
+        if OUTPUT_FILE.exists():
+            with OUTPUT_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            r = data.get("__rarities") if isinstance(data, dict) else None
+            if isinstance(r, list) and all(isinstance(x, str) for x in r):
+                # normalize: lower, dedupe preserving order
+                seen = set(); out = []
+                for x in r:
+                    v = x.strip().lower()
+                    if v and v not in seen:
+                        seen.add(v); out.append(v)
+                return out if out else list(DEFAULT_RARITIES)
+    except Exception:
+        pass
+    return list(DEFAULT_RARITIES)
+
+def write_mapping_with_rarities(mapping: OrderedDict, rarities: list):
+    """Write mapping to OUTPUT_FILE, ensuring '__rarities' is the first key."""
+    out = OrderedDict()
+    # normalized rarities
+    seen = set(); rlist = []
+    for x in rarities:
+        v = str(x).strip().lower()
+        if v and v not in seen:
+            seen.add(v); rlist.append(v)
+    out["__rarities"] = rlist
+    # append kinds
+    for kind, items in mapping.items():
+        out[kind] = items
+    with OUTPUT_FILE.open("w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+
 def build_default_mapping(discovered: OrderedDict, existing: dict) -> OrderedDict:
     out = OrderedDict()
+    allowed = set(load_rarities())
     for kind, items in discovered.items():
         out[kind] = OrderedDict()
         existing_kind = existing.get(kind, {})
         for item in items:
             val = existing_kind.get(item)
-            out[kind][item] = val if val in RARITIES else None
+            out[kind][item] = (val if isinstance(val, str) and val.strip().lower() in allowed else None)
     return out
 
 # --- routes ---
@@ -74,7 +110,7 @@ def index():
         TEMPLATE,
         discovered=discovered,
         mapping=mapping,
-        rarities=RARITIES,
+        rarities=load_rarities(),
         message=message,
         output_filename=str(OUTPUT_FILE.name),
         total_items=sum(len(v) for v in discovered.values())
@@ -86,6 +122,7 @@ def save():
 
     # Gather selections. Each item has checkbox group named "rarity::<kind>::<item>"
     selections = {}
+    allowed = set(load_rarities())
     for kind, items in discovered.items():
         for item in items:
             key = f"rarity::{kind}::{item}"
@@ -94,7 +131,7 @@ def save():
             if not vals:
                 vals = request.form.getlist(f"rarity::{item}")
             rarity = vals[-1].strip().lower() if vals else None
-            if rarity in RARITIES:
+            if rarity in allowed:
                 selections[(kind, item)] = rarity
 
     # Reassemble grouped mapping; unselected items saved as null
@@ -110,12 +147,63 @@ def save():
                 out[kind][item] = None
                 missing += 1
 
-    with OUTPUT_FILE.open("w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+    # persist, keeping rarities list at top
+    write_mapping_with_rarities(out, load_rarities())
 
     return redirect(url_for("index", saved=1, missing=missing))
 
+@app.route("/delete_rarity", methods=["POST"])
+def delete_rarity():
+    target = (request.form.get("r") or "").strip().lower()
+    if not target:
+        return redirect(url_for("index"))
+
+    # Load current rarities and remove target if present
+    cur = load_rarities()
+    if target in cur:
+        cur = [r for r in cur if r != target]
+
+        # Load existing mapping and null-out any items using the deleted rarity
+        existing = load_existing_mapping()
+        cleaned = OrderedDict()
+        if isinstance(existing, dict):
+            for kind, items in existing.items():
+                if kind == "__rarities":
+                    continue
+                if not isinstance(items, dict):
+                    continue
+                inner = OrderedDict()
+                for item, rarity in items.items():
+                    rv = (str(rarity).strip().lower() if isinstance(rarity, str) else None)
+                    inner[item] = None if rv == target else rarity
+                cleaned[kind] = inner
+        # Persist with updated rarities at top
+        write_mapping_with_rarities(cleaned, cur)
+    return redirect(url_for("index"))
+
 # --- inline template (single form + unique checkbox IDs) ---
+@app.route("/add_rarity", methods=["POST"])
+def add_rarity():
+    name = (request.form.get("new_rarity") or "").strip().lower()
+    if not name:
+        return redirect(url_for("index"))
+    cur = load_rarities()
+    if name not in cur:
+        cur.append(name)
+        # merge with existing mapping to preserve data
+        existing = load_existing_mapping()
+        # remove any old key
+        if isinstance(existing, dict) and "__rarities" in existing:
+            existing.pop("__rarities", None)
+        # ensure kinds remain first-order mapping
+        ordered = OrderedDict()
+        for k in existing.keys():
+            if k == "__rarities":
+                continue
+            ordered[k] = existing[k]
+        write_mapping_with_rarities(ordered, cur)
+    return redirect(url_for("index"))
+
 TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
@@ -170,6 +258,18 @@ TEMPLATE = r"""
   </div>
   <!-- This button submits the ONE main form below -->
   <button class="primary" type="submit" form="rarity-form">Save</button>
+  <form method="post" action="{{ url_for('add_rarity') }}" style="display:flex; gap:8px; align-items:center; margin-left:12px;">
+    <input type="text" name="new_rarity" placeholder="Add new rarity…" />
+    <button type="submit">Add</button>
+  </form>
+  <form method="post" action="{{ url_for('delete_rarity') }}" style="display:flex; gap:8px; align-items:center; margin-left:12px;">
+    <select name="r">
+      {% for r in rarities %}
+        <option value="{{ r }}">{{ r }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" onclick="return confirm('Delete selected rarity? Items with this rarity will become unassigned.')">Delete</button>
+  </form>
 </header>
 
 <main>
