@@ -26,6 +26,14 @@ Run the rarity editor
 python rarity_editor.py
 ```
 
+Edit item display aliases (GUI)
+
+```bash
+python alias_editor.py
+# opens http://127.0.0.1:5001
+# after saving, run /shop_alias_reload in Discord to apply without restart
+```
+
 Run the websocket scanner and write discovered items to a file
 
 ```bash

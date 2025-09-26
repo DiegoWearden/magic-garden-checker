@@ -58,6 +58,7 @@ GUILD_SETTINGS_PATH = ROOT / 'guild_settings.json'
 ITEM_RARITIES_PATH  = ROOT / 'item_rarities.json'   # <<— source of truth now
 WATCHLIST_PATH      = ROOT / 'guild_watchlist.json'
 OUT_PATH            = ROOT / 'shop_snapshot.json'
+ITEM_ALIASES_PATH   = ROOT / 'item_aliases.json'
 
 # ---------- Utilities ----------
 def _dprint(msg: str): print(msg, flush=True)
@@ -100,9 +101,27 @@ KIND_BY_VALUE: Dict[str, str] = {}    # watchlist value -> kind
 CANON_MAP: Dict[str, str] = {}        # alias squished -> canonical_key (for matching incoming shop names)
 ITEM_OPTIONS: List[Tuple[str, str, str]] = []  # (label, value, rarity) for watchlist UI
 RARITIES_SET = {"common","uncommon","rare","legendary","mythic","divine","celestial"}
+ALIAS_MAP: Dict[str, str] = {}        # canonical_key -> custom display override
 
 def _add_alias(canon: str, alias_text: str):
     CANON_MAP[_sk(alias_text)] = canon
+
+def _rebuild_item_options():
+    """Rebuild ITEM_OPTIONS using current PRETTY_MAP, ALIAS_MAP, and ITEM_RARITIES.
+    Keeps option values stable (lower pretty name), only label changes with aliases.
+    """
+    global ITEM_OPTIONS
+    ITEM_OPTIONS = []
+    try:
+        for canon, pretty in PRETTY_MAP.items():
+            rarity = ITEM_RARITIES.get(canon, "")
+            display = ALIAS_MAP.get(canon) or pretty
+            label = f"{display}" + (f" — {rarity.capitalize()}" if rarity else "")
+            value = pretty.lower()
+            ITEM_OPTIONS.append((label, value, rarity))
+    except Exception:
+        pass
+
 
 def _load_items():
     global ITEM_RARITIES, KIND_MAP, PRETTY_MAP, VALUE_TO_CANON, KIND_BY_VALUE, CANON_MAP, ITEM_OPTIONS
@@ -154,11 +173,32 @@ def _load_items():
                 for suf in EGG_SUFFIXES:
                     _add_alias(canon, pretty + suf)
 
-            # Build label for watchlist UI
-            label = f"{pretty}" + (f" — {rarity.capitalize()}" if rarity else "")
-            ITEM_OPTIONS.append((label, value, rarity))
+            # watchlist options are rebuilt after aliases are loaded
 
     _dprint(f"[ITEMS] Loaded {len(ITEM_RARITIES)} items from {ITEM_RARITIES_PATH.name}.")
+    _rebuild_item_options()
+
+def _load_aliases():
+    global ALIAS_MAP
+    ALIAS_MAP = {}
+    try:
+        data = json.loads(ITEM_ALIASES_PATH.read_text(encoding='utf-8') or '{}')
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    ck = _sk(str(k))
+                    disp = str(v).strip()
+                    if ck and disp:
+                        ALIAS_MAP[ck] = disp
+                except Exception:
+                    continue
+        _dprint(f"[ALIASES] Loaded {len(ALIAS_MAP)} alias(es) from {ITEM_ALIASES_PATH.name}.")
+    except FileNotFoundError:
+        _dprint(f"[ALIASES] {ITEM_ALIASES_PATH.name} not found; using no overrides.")
+    except Exception as e:
+        _dprint(f"[ALIASES] Failed to load {ITEM_ALIASES_PATH.name}: {e}")
+    finally:
+        _rebuild_item_options()
 
 def _canonical_key_for_name(name: Optional[str]) -> Optional[str]:
     if not name: return None
@@ -175,7 +215,9 @@ def _canonical_key_for_name(name: Optional[str]) -> Optional[str]:
 
 def _pretty_from_raw(name: Optional[str]) -> str:
     ck = _canonical_key_for_name(name)
-    if ck: 
+    if ck:
+        if ck in ALIAS_MAP and ALIAS_MAP[ck]:
+            return ALIAS_MAP[ck]
         return PRETTY_MAP.get(ck, _humanize(name or "unknown"))
     return _humanize(name or "unknown")
 
@@ -186,6 +228,7 @@ def _rarity_from_raw(name: Optional[str]) -> str:
 
 # Initialize from file
 _load_items()
+_load_aliases()
 
 # ---------- Rarity order (kept for reference/sorting if needed) ----------
 RARITY_ORDER = {
@@ -853,6 +896,14 @@ async def shop_stock(interaction: discord.Interaction):
     msg = "\n".join(lines)
     if len(msg) > 1900: msg = msg[:1900] + '\n...truncated'
     await interaction.followup.send(msg, ephemeral=True)
+
+@tree.command(name="shop_alias_reload", description="Reload item display aliases from item_aliases.json")
+async def shop_alias_reload(interaction: discord.Interaction):
+    try:
+        _load_aliases()
+        await interaction.response.send_message(f"Reloaded {len(ALIAS_MAP)} alias(es) from item_aliases.json.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to reload aliases: {e}", ephemeral=True)
 
 # ---------- Events ----------
 @client.event

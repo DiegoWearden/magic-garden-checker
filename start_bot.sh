@@ -1,0 +1,1 @@
+( export XDG_CACHE_HOME="$PWD/.cache" PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" && ./venv/bin/python -m playwright install chromium && ./venv/bin/python bot.py )

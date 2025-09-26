@@ -26,7 +26,9 @@
     "DragonFruit": "divine",
     "Lychee": "divine",
     "Sunflower": "divine",
-    "Starweaver": "celestial"
+    "Starweaver": "celestial",
+    "DawnCelestial": "celestial",
+    "MoonCelestial": "celestial"
   },
   "tool": {
     "WateringCan": "common",
